@@ -5,3 +5,4 @@ pytesseract
 openpyxl
 numpy
 pillow
+python-docx
