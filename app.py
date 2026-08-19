@@ -17,6 +17,8 @@ import cv2
 import numpy as np
 import pytesseract
 
+PARSER_VERSION = "2.2-native-verified"
+
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
     'MAG':5,'MAGGIO':5,'GIU':6,'GIUGNO':6,'LUG':7,'LUGLIO':7,'AGO':8,'AGOSTO':8,
@@ -479,15 +481,176 @@ def parse_graphic_field_table(page):
         teams[name]=TeamInfo(name,locality,addr,tm,fieldloc)
     return teams
 
+
+
+def parse_modern_native_calendar(page, teams):
+    """
+    Legge i calendari grafici moderni direttamente dal testo nativo del PDF.
+
+    In molti PDF CRL/LND l'ordine interno è:
+        CASA
+        -
+        OSPITE
+        ... (tutte le gare della giornata)
+        GIORNATA N
+        A. gg/mm/aaaa
+        R. gg/mm/aaaa
+
+    È molto più stabile dell'OCR su Streamlit Cloud e impedisce che una
+    singola gara venga persa per differenze di versione di Tesseract.
+    """
+    raw = page.get_text('text') or ''
+    lines = [clean(x) for x in raw.splitlines() if clean(x)]
+    if not lines:
+        return []
+
+    # Occorrenze delle intestazioni GIORNATA nel testo nativo.
+    headers = []
+    for i, ln in enumerate(lines):
+        m = re.search(r'GIORNATA\s*(\d+)|(?:^|\s)(\d+)\s*GIORNATA', ln, re.I)
+        if m:
+            rn = m.group(1) or m.group(2)
+            headers.append((i, rn))
+    if not headers:
+        return []
+
+    out = []
+    segment_start = 0
+    parsed_rounds = 0
+
+    for hidx, (i, round_no) in enumerate(headers):
+        # Le gare della giornata precedono l'intestazione GIORNATA.
+        segment = lines[segment_start:i]
+        pairs = []
+
+        # Formato più comune: CASA / '-' / OSPITE.
+        for j in range(1, len(segment)-1):
+            sep = segment[j].strip()
+            if sep not in {'-', '–', '—', '='}:
+                continue
+            home_raw = segment[j-1]
+            away_raw = segment[j+1]
+            if not home_raw or not away_raw:
+                continue
+            home = canonical_team(home_raw, teams, .62)
+            away = canonical_team(away_raw, teams, .62)
+            if home and away and home != away:
+                pair = (home, away)
+                if pair not in pairs:
+                    pairs.append(pair)
+
+        # Fallback: alcune estrazioni native tengono "CASA - OSPITE" su una riga.
+        if not pairs:
+            for ln in segment:
+                m = re.match(r'(.+?)\s+[-–—]\s+(.+)$', ln)
+                if not m:
+                    continue
+                home = canonical_team(m.group(1), teams, .62)
+                away = canonical_team(m.group(2), teams, .62)
+                if home and away and home != away:
+                    pair = (home, away)
+                    if pair not in pairs:
+                        pairs.append(pair)
+
+        # Date A./R. sono immediatamente dopo l'intestazione.
+        da = ''
+        dr = ''
+        scan_end = headers[hidx+1][0] if hidx+1 < len(headers) else min(len(lines), i+8)
+        # Non serve arrivare alla giornata successiva: bastano poche righe.
+        scan_end = min(scan_end, i+8)
+        for ln in lines[i+1:scan_end]:
+            ma = re.search(r'\bA[.,]?\s*(\d{1,2}[./-]\d{1,2}[./-]20\d{2})', ln, re.I)
+            mr = re.search(r'\bR[.,]?\s*(\d{1,2}[./-]\d{1,2}[./-]20\d{2})', ln, re.I)
+            if ma and not da:
+                da = normalize_numeric_date(ma.group(1))
+            if mr and not dr:
+                dr = normalize_numeric_date(mr.group(1))
+
+        if pairs and da:
+            parsed_rounds += 1
+            for home, away in pairs:
+                ti = teams.get(home, TeamInfo(home))
+                out.append(Match(da, home, away, ti.time, ti.locality, ti.address, str(round_no)))
+                if dr:
+                    ti2 = teams.get(away, TeamInfo(away))
+                    out.append(Match(dr, away, home, ti2.time, ti2.locality, ti2.address, str(round_no)))
+
+        # Il segmento successivo parte dopo le righe A./R.
+        next_start = i + 1
+        while next_start < len(lines) and next_start < i + 8:
+            ln = lines[next_start]
+            if re.search(r'\b[AR][.,]?\s*\d{1,2}[./-]\d{1,2}[./-]20\d{2}', ln, re.I):
+                next_start += 1
+                continue
+            break
+        segment_start = next_start
+
+    # Usa il parser nativo solo se ha letto praticamente tutte le giornate.
+    # Altrimenti si lascia lavorare il fallback OCR già esistente.
+    if parsed_rounds >= max(1, int(len(headers) * .85)):
+        return out
+    return []
+
 def parse_graphic_calendar(page,teams):
+    # Prima prova il testo nativo: è deterministico e non dipende dalla
+    # versione di Tesseract installata su Streamlit Cloud.
+    native = parse_modern_native_calendar(page, teams)
+    if native:
+        return native
+
     img=render_page(page,2)
     boxes=find_white_calendar_boxes(img)
-    # date OCR from whole page
-    whole=ocr_img(img,6)
-    a_dates=re.findall(r'\bA[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',whole)
-    r_dates=re.findall(r'\bR[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',whole)
-    a_dates=[normalize_numeric_date(x) for x in a_dates]
-    r_dates=[normalize_numeric_date(x) for x in r_dates]
+
+    # --------------------------------------------------------
+    # DATE DELLE GIORNATE
+    # --------------------------------------------------------
+    # Nei PDF grafici moderni il testo delle squadre può avere una
+    # mappa-font problematica, mentre le date A./R. sono spesso
+    # perfettamente estraibili dal testo nativo del PDF.
+    # Usiamo quindi PRIMA il testo nativo e OCR solo come fallback.
+    # Questo evita, per esempio, di perdere il ritorno dell'ultima
+    # giornata quando Tesseract non riconosce una singola data.
+    direct_text=page.get_text('text') or ''
+
+    a_direct=re.findall(
+        r'\bA[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',
+        direct_text,
+        re.I
+    )
+    r_direct=re.findall(
+        r'\bR[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',
+        direct_text,
+        re.I
+    )
+
+    a_dates=[normalize_numeric_date(x) for x in a_direct]
+    r_dates=[normalize_numeric_date(x) for x in r_direct]
+    a_dates=[x for x in a_dates if x]
+    r_dates=[x for x in r_dates if x]
+
+    # Se il testo nativo non restituisce abbastanza date, completa
+    # la lettura tramite OCR dell'intera pagina.
+    if len(a_dates)<len(boxes) or len(r_dates)<len(boxes):
+        whole=ocr_img(img,6)
+        a_ocr=[normalize_numeric_date(x) for x in re.findall(
+            r'\bA[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',
+            whole,
+            re.I
+        )]
+        r_ocr=[normalize_numeric_date(x) for x in re.findall(
+            r'\bR[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',
+            whole,
+            re.I
+        )]
+        a_ocr=[x for x in a_ocr if x]
+        r_ocr=[x for x in r_ocr if x]
+
+        # Preferisce la fonte che ha riconosciuto più giornate.
+        if len(a_ocr)>len(a_dates):
+            a_dates=a_ocr
+        if len(r_ocr)>len(r_dates):
+            r_dates=r_ocr
+
     names=list(teams)
     out=[]
     for idx,box in enumerate(boxes):
@@ -679,7 +842,7 @@ def safe_filename(s):
 
 
 @st.cache_data(show_spinner=False)
-def analyze_upload(file_bytes, filename):
+def analyze_upload_v2(file_bytes, filename):
     suffix=Path(filename).suffix.lower()
     if suffix not in ['.pdf','.docx']:
         raise ValueError('Sono supportati file PDF e DOCX.')
@@ -699,6 +862,7 @@ def analyze_upload(file_bytes, filename):
 
 st.set_page_config(page_title='Calendario → Excel', page_icon='⚽', layout='centered')
 st.title('⚽ Calendario → Excel')
+st.caption(f'Versione app: {PARSER_VERSION}')
 st.write('Carica un calendario LND/FIGC, scegli il girone e la squadra, quindi scarica l’Excel.')
 
 uploaded=st.file_uploader('1. Carica il calendario', type=['pdf','docx'])
@@ -706,7 +870,7 @@ uploaded=st.file_uploader('1. Carica il calendario', type=['pdf','docx'])
 if uploaded is not None:
     with st.spinner('Analisi del calendario in corso…'):
         try:
-            sections=analyze_upload(uploaded.getvalue(), uploaded.name)
+            sections=analyze_upload_v2(uploaded.getvalue(), uploaded.name)
         except Exception as e:
             st.error(f'Errore durante la lettura del file: {e}')
             st.stop()
@@ -742,6 +906,7 @@ if uploaded is not None:
     st.write(f'Partite trovate per **{selected_team}**: **{len(team_matches)}**')
 
     with st.expander('Dettagli analisi'):
+        st.write(f'Versione parser: `{PARSER_VERSION}`')
         st.write(f'Formato riconosciuto: `{section.source_format}`')
         st.write(f'Squadre nel girone: {len(teams)}')
         st.write(f'Partite complessive lette: {len(section.matches)}')
