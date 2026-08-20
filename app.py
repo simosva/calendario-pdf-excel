@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-PARSER_VERSION = "2.3-layout-native"
+PARSER_VERSION = "2.4-cache-fix"
 
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
@@ -1088,7 +1088,10 @@ def safe_filename(s):
 
 
 @st.cache_data(show_spinner=False)
-def analyze_upload_v2(file_bytes, filename):
+def analyze_upload_v24(file_bytes, filename, parser_version):
+    # parser_version e' volutamente un argomento: entra nella chiave della cache
+    # di Streamlit. Quando aggiorniamo il parser, i risultati delle vecchie
+    # versioni non possono quindi essere riutilizzati per errore.
     suffix=Path(filename).suffix.lower()
     if suffix not in ['.pdf','.docx']:
         raise ValueError('Sono supportati file PDF e DOCX.')
@@ -1105,6 +1108,32 @@ def analyze_upload_v2(file_bytes, filename):
             try: os.remove(tmp)
             except: pass
 
+def diagnose_pdf_bytes(file_bytes):
+    """Diagnostica minima per capire dove si ferma un PDF non riconosciuto."""
+    tmp=None
+    info={'pagine':0,'giornate_p1':0,'squadre_p2':0,'gare_layout':0}
+    try:
+        with tempfile.NamedTemporaryFile(delete=False,suffix='.pdf') as f:
+            f.write(file_bytes)
+            tmp=f.name
+        doc=fitz.open(tmp)
+        info['pagine']=len(doc)
+        if len(doc)>=1:
+            info['giornate_p1']=len(detect_modern_round_headers(doc[0]))
+        if len(doc)>=2:
+            teams=parse_modern_field_table_words_v2(doc[1])
+            info['squadre_p2']=len(teams)
+            if teams:
+                info['gare_layout']=len(parse_modern_layout_calendar(doc[0],teams))
+        return info
+    except Exception as e:
+        info['errore']=str(e)
+        return info
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.remove(tmp)
+            except: pass
+
 
 st.set_page_config(page_title='Calendario → Excel', page_icon='⚽', layout='centered')
 st.title('⚽ Calendario → Excel')
@@ -1116,13 +1145,22 @@ uploaded=st.file_uploader('1. Carica il calendario', type=['pdf','docx'])
 if uploaded is not None:
     with st.spinner('Analisi del calendario in corso…'):
         try:
-            sections=analyze_upload_v2(uploaded.getvalue(), uploaded.name)
+            sections=analyze_upload_v24(uploaded.getvalue(), uploaded.name, PARSER_VERSION)
         except Exception as e:
             st.error(f'Errore durante la lettura del file: {e}')
             st.stop()
 
     if not sections:
-        st.error('Non sono riuscito a riconoscere partite nel file. Il formato potrebbe essere diverso da quelli attualmente supportati.')
+        st.error('Non sono riuscito a riconoscere partite nel file.')
+        if Path(uploaded.name).suffix.lower()=='.pdf':
+            diag=diagnose_pdf_bytes(uploaded.getvalue())
+            with st.expander('Diagnostica PDF', expanded=True):
+                st.write(f"Pagine lette: **{diag.get('pagine',0)}**")
+                st.write(f"Intestazioni GIORNATA rilevate nella pagina 1: **{diag.get('giornate_p1',0)}**")
+                st.write(f"Squadre rilevate nella tabella della pagina 2: **{diag.get('squadre_p2',0)}**")
+                st.write(f"Righe gara ricostruite dal layout: **{diag.get('gare_layout',0)}**")
+                if diag.get('errore'):
+                    st.code(diag['errore'])
         st.stop()
 
     st.success(f'Analisi completata: {len(sections)} sezione/i di calendario riconosciuta/e.')
