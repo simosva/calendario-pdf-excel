@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-PARSER_VERSION = "2.2-native-verified"
+PARSER_VERSION = "2.3-layout-native"
 
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
@@ -483,6 +483,228 @@ def parse_graphic_field_table(page):
 
 
 
+
+def _group_word_lines(words, tol=2.2):
+    """Raggruppa le parole PDF che appartengono alla stessa riga visiva."""
+    rows=[]
+    for w in sorted(words,key=lambda x:((x[1]+x[3])/2,x[0])):
+        yc=(w[1]+w[3])/2
+        if not rows or abs(yc-rows[-1][0])>tol:
+            rows.append([yc,[w]])
+        else:
+            rows[-1][1].append(w)
+    return rows
+
+
+def _team_base_key(name):
+    """Chiave squadra senza le sole forme societarie finali (ASD, SSD, SRL...)."""
+    s=clean(name)
+    patterns=[
+        r'S\.?S\.?D\.?\s*A\.?\s*R\.?\s*L\.?$', r'SSD\s*A\s*R\s*L$',
+        r'S\.?S\.?D\.?$', r'SSD(?:ARL|RL)?$', r'A\.?S\.?D\.?$', r'ASD$',
+        r'S\.?R\.?L\.?$', r'SRL$', r'A\.?\s*R\.?\s*L\.?$', r'ARL$',
+        r'C\.?V\.?$', r'F\.?B\.?C\.?$', r'POL\.?D\.?$', r'POL\.?$'
+    ]
+    changed=True
+    while changed:
+        changed=False
+        for pat in patterns:
+            ns=re.sub(r'\s*\b'+pat,'',s).strip(' .-')
+            if ns!=s:
+                s=ns; changed=True
+    return re.sub(r'[^A-Z0-9]+','',s)
+
+
+def smart_canonical_team(name, teams):
+    """Associa il nome abbreviato del calendario alla riga corretta della tabella campi."""
+    c=clean(name)
+    # Nei calendari CRL "AC." / "ACC." è spesso abbreviazione di ACADEMY/ACCADEMIA.
+    ab=re.match(r'^(?:ACC?\.)\s*(.+)$',c)
+    if ab:
+        rem=_team_base_key(ab.group(1)); candidates=[]
+        for t in teams:
+            mt=re.match(r'^(?:ACADEMY|ACCADEMIA)\s+(.+)$',clean(t))
+            if mt:
+                sc=SequenceMatcher(None,rem,_team_base_key(mt.group(1))).ratio()
+                candidates.append((sc,t))
+        if candidates:
+            sc,t=max(candidates)
+            if sc>=.72:
+                return t
+
+    q=_team_base_key(name)
+    exact=[t for t in teams if _team_base_key(t)==q]
+    if len(exact)==1:
+        return exact[0]
+
+    best=None; best_score=0
+    for t in teams:
+        k=_team_base_key(t)
+        sc=SequenceMatcher(None,q,k).ratio()
+        if len(q)>=5 and (q in k or k in q):
+            extra=abs(len(q)-len(k))
+            sc=max(sc,.93-min(.20,extra*.01))
+        if sc>best_score:
+            best,best_score=t,sc
+    return best if best_score>=.66 else None
+
+
+def parse_modern_field_table_words_v2(page):
+    """
+    Legge le nuove tabelle CRL/LND con intestazioni:
+    Società | N. | Campo / Località | Indirizzo | Orario | Giorno.
+    Usa le coordinate delle parole del PDF, non OCR e non coordinate verticali fisse.
+    """
+    words=page.get_text('words') or []
+    def arr(pred): return [w for w in words if pred(clean(w[4]))]
+    soc=arr(lambda t:t.startswith('SOCIETA'))
+    code=arr(lambda t:t in {'N.','N'})
+    campo=arr(lambda t:t=='CAMPO')
+    addr=arr(lambda t:t.startswith('INDIRIZZO'))
+    tm=arr(lambda t:t.startswith('ORARIO'))
+    day=arr(lambda t:t.startswith('GIORNO'))
+    if not (soc and code and campo and addr):
+        return {}
+
+    hdr_y=min(w[1] for w in soc+code+campo+addr)
+    pick=lambda a:min(a,key=lambda w:abs(w[1]-hdr_y))
+    sx,cx,fx,ax=pick(soc)[0],pick(code)[0],pick(campo)[0],pick(addr)[0]
+    tx=pick(tm)[0] if tm else page.rect.width
+    dx=pick(day)[0] if day else page.rect.width
+
+    data=[w for w in words if w[1]>hdr_y+7 and w[1]<page.rect.height*.90]
+    teams={}
+    for _,ws in _group_word_lines(data,2.2):
+        ordered=sorted(ws,key=lambda q:q[0])
+        code_txt=clean(' '.join(w[4] for w in ordered if cx-4<=w[0]<fx-4))
+        if not re.fullmatch(r'\d{1,5}',code_txt):
+            continue
+        name=clean(' '.join(w[4] for w in ordered if sx-4<=w[0]<cx-4))
+        fieldloc=clean(' '.join(w[4] for w in ordered if fx-4<=w[0]<ax-4))
+        if tm:
+            address=clean(' '.join(w[4] for w in ordered if ax-4<=w[0]<tx-4))
+            time_txt=clean(' '.join(w[4] for w in ordered if tx-4<=w[0]<dx-4))
+        else:
+            address=clean(' '.join(w[4] for w in ordered if ax-4<=w[0]<page.rect.width))
+            time_txt=''
+        if not name or name.startswith('SOCIETA'):
+            continue
+        teams[name]=TeamInfo(
+            name=name,
+            locality=extract_locality_from_field(fieldloc),
+            address=address,
+            time=normalize_time(time_txt),
+            field_name=fieldloc,
+        )
+    return teams
+
+
+def detect_modern_round_headers(page):
+    """Trova GIORNATA 1..N tramite posizione delle parole nel PDF."""
+    words=page.get_text('words') or []
+    headers=[]
+    for w in words:
+        if clean(w[4])!='GIORNATA':
+            continue
+        yc=(w[1]+w[3])/2
+        candidates=[]
+        for q in words:
+            if not re.fullmatch(r'\d{1,2}',clean(q[4])):
+                continue
+            qy=(q[1]+q[3])/2
+            if abs(qy-yc)<3 and q[0]>=w[2]-3 and q[0]-w[2]<30:
+                candidates.append(q)
+        if candidates:
+            q=min(candidates,key=lambda z:z[0])
+            headers.append({'rn':int(q[4]),'x':w[0],'y':w[1]})
+    # elimina eventuali duplicati mantenendo una sola intestazione per numero
+    return list({h['rn']:h for h in headers}.values())
+
+
+def parse_modern_layout_calendar(page, teams):
+    """
+    Parser dei calendari grafici 2026/27 (Eccellenza, U14/U15/U16/U17 ecc.).
+    La pagina contiene più riquadri affiancati: il normale get_text() mescola le
+    colonne. Qui ricostruiamo ogni riquadro dalle coordinate X/Y delle parole.
+    """
+    words=page.get_text('words') or []
+    headers=detect_modern_round_headers(page)
+    if len(headers)<3:
+        return []
+
+    header_rows=[]
+    for h in sorted(headers,key=lambda z:(z['y'],z['x'])):
+        if not header_rows or abs(h['y']-header_rows[-1][0])>8:
+            header_rows.append([h['y'],[h]])
+        else:
+            header_rows[-1][1].append(h)
+
+    matches=[]
+    for ri,(hy,group) in enumerate(header_rows):
+        group=sorted(group,key=lambda z:z['x'])
+        slots=len(group)
+        next_hy=header_rows[ri+1][0] if ri+1<len(header_rows) else page.rect.height*.86
+        band=[w for w in words if w[1]>=hy-2 and w[1]<next_hy-4]
+
+        # Le righe gara hanno un trattino centrale per ciascun riquadro.
+        match_lines=[]
+        for yc,lw in _group_word_lines(band,2.0):
+            seps=sorted([w for w in lw if clean(w[4]) in {'-','–','—'}],key=lambda w:w[0])
+            if len(seps)>=slots and yc>hy+20:
+                match_lines.append((yc,sorted(lw,key=lambda w:w[0]),seps))
+        if not match_lines:
+            continue
+
+        # Centro di ciascun riquadro = posizione mediana del trattino CASA-OSPITE.
+        centers=[]
+        for j in range(slots):
+            vals=[(seps[j][0]+seps[j][2])/2 for _,_,seps in match_lines if len(seps)>=slots]
+            centers.append(statistics.median(vals))
+        bounds=[0]+[(centers[j]+centers[j+1])/2 for j in range(slots-1)]+[page.rect.width]
+
+        # Date A/R: assegna ciascuna data al riquadro più vicino.
+        first_match_y=min(y for y,_,_ in match_lines)
+        date_map={j:[] for j in range(slots)}
+        for w in band:
+            if w[1]>=first_match_y:
+                continue
+            dt=normalize_numeric_date(w[4])
+            if not dt:
+                continue
+            xc=(w[0]+w[2])/2
+            j=min(range(slots),key=lambda k:abs(xc-centers[k]))
+            if dt not in date_map[j]:
+                date_map[j].append(dt)
+
+        pair_map={j:[] for j in range(slots)}
+        for _,lw,seps in match_lines:
+            for j,c in enumerate(centers):
+                sep=min(seps,key=lambda z:abs(((z[0]+z[2])/2)-c))
+                sc=(sep[0]+sep[2])/2
+                x0,x1=bounds[j],bounds[j+1]
+                left=[w for w in lw if x0<=((w[0]+w[2])/2)<sc-1 and clean(w[4]) not in {'-','–','—'}]
+                right=[w for w in lw if sc+1<((w[0]+w[2])/2)<x1 and clean(w[4]) not in {'-','–','—'}]
+                home_raw=clean(' '.join(w[4] for w in sorted(left,key=lambda w:w[0])))
+                away_raw=clean(' '.join(w[4] for w in sorted(right,key=lambda w:w[0])))
+                if home_raw and away_raw:
+                    pair_map[j].append((home_raw,away_raw))
+
+        for j,h in enumerate(group):
+            dates=date_map[j]
+            if not dates:
+                continue
+            andata=dates[0]
+            ritorno=dates[1] if len(dates)>1 else ''
+            for home_raw,away_raw in pair_map[j]:
+                home=smart_canonical_team(home_raw,teams) or home_raw
+                away=smart_canonical_team(away_raw,teams) or away_raw
+                ti=teams.get(home,TeamInfo(home))
+                matches.append(Match(andata,home,away,ti.time,ti.locality,ti.address,str(h['rn'])))
+                if ritorno:
+                    ti2=teams.get(away,TeamInfo(away))
+                    matches.append(Match(ritorno,away,home,ti2.time,ti2.locality,ti2.address,str(h['rn'])))
+    return matches
+
 def parse_modern_native_calendar(page, teams):
     """
     Legge i calendari grafici moderni direttamente dal testo nativo del PDF.
@@ -723,15 +945,35 @@ def parse_pdf(path):
     doc=fitz.open(path)
     texts=[p.get_text('text') for p in doc]
     alltext='\n'.join(texts)
+
+    # Programma Gare / Coppe: struttura tabellare diversa dal calendario A/R.
     if 'PROGRAMMA GARE' in alltext.upper() and re.search(r'GIRONE\s+\d+',alltext,re.I):
         secs=[]
-        for t in texts:secs.extend(parse_programma_gare_page(t))
+        for t in texts:
+            secs.extend(parse_programma_gare_page(t))
         return secs
+
     sections=[]
-    # process page pairs where next has field table
     used=set()
+
+    # 1) Nuovi calendari grafici CRL/LND: pagina calendario + pagina tabella campi.
+    #    Non cerchiamo la frase "ELENCO CAMPI": nei file U14/U15/U16/U17 non c'è.
+    for pi in range(len(doc)-1):
+        if pi in used:
+            continue
+        headers=detect_modern_round_headers(doc[pi])
+        teams_modern=parse_modern_field_table_words_v2(doc[pi+1])
+        if len(headers)>=3 and len(teams_modern)>=4:
+            comp,group=parse_header_comp_group(texts[pi+1])
+            matches=parse_modern_layout_calendar(doc[pi],teams_modern)
+            if matches:
+                sections.append(Section(comp or 'CALENDARIO',group,teams_modern,matches,'modern_native_layout'))
+                used.update([pi,pi+1])
+
+    # 2) Formati classici / provinciali già supportati.
     for pi,t in enumerate(texts):
-        if pi in used:continue
+        if pi in used:
+            continue
         nxt=texts[pi+1] if pi+1<len(texts) else ''
         if ('GIORNATA' in t.upper() or 'G I O R N A T A' in t.upper()) and ('E L E N C O' in nxt.upper() and ('CAMPI' in nxt.upper() or 'C A M P I' in nxt.upper())):
             comp,group=parse_header_comp_group(t+'\n'+nxt)
@@ -743,17 +985,19 @@ def parse_pdf(path):
             if 'ANDATA:' in t.upper():
                 matches=parse_classic_segment(t,teams); fmt='classic'
             elif direct_text_quality(t)>.80:
-                matches=parse_simple_calendar(t,teams,comp,group);fmt='simple_graphic_text'
+                matches=parse_simple_calendar(t,teams,comp,group); fmt='simple_graphic_text'
             else:
-                matches=parse_graphic_calendar(doc[pi],teams);fmt='graphic_ocr'
-            sections.append(Section(comp or 'CALENDARIO',group,teams,matches,fmt));used.update([pi,pi+1])
-    # fallback corrupted two-page modern graphics where field page direct text is bad, so keyword missing
+                matches=parse_graphic_calendar(doc[pi],teams); fmt='graphic_ocr'
+            if matches:
+                sections.append(Section(comp or 'CALENDARIO',group,teams,matches,fmt))
+                used.update([pi,pi+1])
+
+    # 3) Fallback OCR per vecchi PDF grafici con mappa-font corrotta.
     if not sections and len(doc)>=2:
         teams=parse_graphic_field_table(doc[1])
         if teams:
             ocrhead=ocr_img(render_page(doc[1],2)[:380,:,:],6)
             comp,group=parse_header_comp_group(ocrhead)
-            # In modern PDFs the title itself is often extractable even when the rest uses a broken font map.
             first_clean=''
             for ln in texts[1].splitlines():
                 c=clean(ln)
@@ -763,7 +1007,9 @@ def parse_pdf(path):
             if first_clean and 'GIRONE' not in first_clean and len(first_clean)<80:
                 comp=first_clean
             matches=parse_graphic_calendar(doc[0],teams)
-            sections.append(Section(comp or 'CALENDARIO',group,teams,matches,'graphic_ocr'))
+            if matches:
+                sections.append(Section(comp or 'CALENDARIO',group,teams,matches,'graphic_ocr'))
+
     return [s for s in sections if s.matches]
 
 def parse_docx(path):
