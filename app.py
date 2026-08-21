@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-PARSER_VERSION = "2.4-cache-fix"
+PARSER_VERSION = "2.5-excel-format"
 
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
@@ -1048,6 +1048,26 @@ def sort_date_value(s):
         return datetime.max
 
 
+def excel_date_value(value):
+    """Converte gg/mm/aaaa in una vera data Excel."""
+    value=clean(value)
+    for fmt in ('%d/%m/%Y','%d/%m/%y'):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+    return value
+
+def excel_time_value(value):
+    """Converte HH:MM / HH.MM in un vero orario Excel."""
+    value=normalize_time(value)
+    if not value:
+        return ''
+    try:
+        return datetime.strptime(value, '%H:%M').time()
+    except ValueError:
+        return value
+
 def create_excel_for_team(section, selected_team):
     selected=[m for m in section.matches if m.home==selected_team or m.away==selected_team]
     selected=sorted(selected,key=lambda m:(sort_date_value(m.date),m.time,m.home,m.away))
@@ -1058,13 +1078,19 @@ def create_excel_for_team(section, selected_team):
     ws.append(['Data','Ora','Tipo','Squadra casa','Squadra ospite','Indirizzo'])
     for m in selected:
         ws.append([
-            m.date,
-            m.time,
+            excel_date_value(m.date),
+            excel_time_value(m.time),
             'CAMPIONATO',
             m.home,
             m.away,
             indirizzo_excel(m),
         ])
+        row=ws.max_row
+        # Formati richiesti nell'Excel: gg/mm/aa e hh:mm
+        ws.cell(row=row,column=1).number_format='dd/mm/yy'
+        ws.cell(row=row,column=2).number_format='hh:mm'
+        ws.cell(row=row,column=1).alignment=Alignment(horizontal='center')
+        ws.cell(row=row,column=2).alignment=Alignment(horizontal='center')
 
     for c in ws[1]:
         c.font=Font(bold=True)
