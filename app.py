@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-PARSER_VERSION = "2.6-u18-bye-fix"
+PARSER_VERSION = "2.7-sabato-date-fix"
 
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
@@ -96,6 +96,7 @@ class TeamInfo:
     address:str=''
     time:str=''
     field_name:str=''
+    day:str=''
 
 @dataclass
 class Match:
@@ -217,7 +218,13 @@ def parse_field_table_text(text):
         addr=clean(cells[4])
         if not name or name in ["SOCIETA'",'SOCIETA']:continue
         locality=extract_locality_from_field(fieldloc)
-        teams[name]=TeamInfo(name,locality,addr,tm,fieldloc)
+        day=''
+        for extra in cells[5:]:
+            ce=clean(extra)
+            if ce in {'SABATO','DOMENICA','VENERDI','VENERDÌ'}:
+                day=ce.title()
+                break
+        teams[name]=TeamInfo(name,locality,addr,tm,fieldloc,day)
     return teams
 
 def extract_locality_from_field(s):
@@ -584,6 +591,10 @@ def parse_modern_field_table_words_v2(page):
         w for w in words
         if clean(w[4]).startswith('ORARIO') and abs(w[1] - hdr_y) < 5
     ]
+    day_headers = [
+        w for w in words
+        if clean(w[4]).startswith('GIORNO') and abs(w[1] - hdr_y) < 5
+    ]
 
     if not (code_headers and campo_headers and addr_headers):
         return {}
@@ -592,6 +603,7 @@ def parse_modern_field_table_words_v2(page):
     fx = campo_headers[0][0]
     ax = addr_headers[0][0]
     tx = time_headers[0][0] if time_headers else page.rect.width
+    dx = day_headers[0][0] if day_headers else page.rect.width
 
     data_words = [
         w for w in words
@@ -633,6 +645,15 @@ def parse_modern_field_table_words_v2(page):
         if time_candidates:
             time_word = min(time_candidates, key=lambda w: abs(w[0] - tx))
 
+        day_candidates = [
+            w for w in ordered
+            if clean(w[4]) in {'SABATO', 'DOMENICA', 'VENERDI', 'VENERDÌ'}
+            and w[0] >= tx
+        ]
+        day_word = None
+        if day_candidates:
+            day_word = min(day_candidates, key=lambda w: abs(w[0] - dx))
+
         middle = [
             w for w in ordered
             if w[0] > code_word[2] + 1
@@ -665,6 +686,7 @@ def parse_modern_field_table_words_v2(page):
         fieldloc = clean(' '.join(w[4] for w in field_words))
         address = clean(' '.join(w[4] for w in addr_words))
         tm = normalize_time(time_word[4]) if time_word else ''
+        day = clean(day_word[4]).title() if day_word else ''
 
         if not fieldloc:
             continue
@@ -675,6 +697,7 @@ def parse_modern_field_table_words_v2(page):
             address=address,
             time=tm,
             field_name=fieldloc,
+            day=day,
         )
 
     return teams
@@ -1285,9 +1308,52 @@ def excel_time_value(value):
     except ValueError:
         return value
 
+
+def adjusted_match_date(section, match):
+    """
+    Restituisce la data effettiva della gara.
+
+    Nei calendari CRL/LND la data stampata nella pagina delle giornate è
+    normalmente la data ufficiale della domenica. Se la squadra di casa
+    ha "Sabato" nella colonna Giorno della tabella campi, la gara si gioca
+    il giorno precedente.
+
+    La correzione viene applicata solo quando la data ufficiale è domenica:
+    eventuali turni infrasettimanali restano quindi invariati.
+    """
+    try:
+        dt = datetime.strptime(match.date, '%d/%m/%Y')
+    except Exception:
+        return match.date
+
+    info = section.teams.get(match.home)
+    day = clean(info.day) if info else ''
+
+    # Python: lun=0 ... dom=6
+    if dt.weekday() == 6:
+        if day == 'SABATO':
+            from datetime import timedelta
+            dt = dt - timedelta(days=1)
+        elif day in {'VENERDI', 'VENERDI'}:
+            from datetime import timedelta
+            dt = dt - timedelta(days=2)
+
+    return dt.strftime('%d/%m/%Y')
+
+
+def adjusted_sort_key(section, match):
+    actual_date = adjusted_match_date(section, match)
+    return (
+        sort_date_value(actual_date),
+        match.time,
+        match.home,
+        match.away,
+    )
+
+
 def create_excel_for_team(section, selected_team):
     selected=[m for m in section.matches if m.home==selected_team or m.away==selected_team]
-    selected=sorted(selected,key=lambda m:(sort_date_value(m.date),m.time,m.home,m.away))
+    selected=sorted(selected,key=lambda m:adjusted_sort_key(section,m))
 
     wb=Workbook()
     ws=wb.active
@@ -1295,7 +1361,7 @@ def create_excel_for_team(section, selected_team):
     ws.append(['Data','Ora','Tipo','Squadra casa','Squadra ospite','Indirizzo'])
     for m in selected:
         ws.append([
-            excel_date_value(m.date),
+            excel_date_value(adjusted_match_date(section,m)),
             excel_time_value(m.time),
             'CAMPIONATO',
             m.home,
