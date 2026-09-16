@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-PARSER_VERSION = "2.7-sabato-date-fix"
+PARSER_VERSION = "2.8-weekend-day-alignment"
 
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
@@ -1311,15 +1311,17 @@ def excel_time_value(value):
 
 def adjusted_match_date(section, match):
     """
-    Restituisce la data effettiva della gara.
+    Restituisce la data effettiva della gara applicando la regola CRL/LND:
 
-    Nei calendari CRL/LND la data stampata nella pagina delle giornate è
-    normalmente la data ufficiale della domenica. Se la squadra di casa
-    ha "Sabato" nella colonna Giorno della tabella campi, la gara si gioca
-    il giorno precedente.
-
-    La correzione viene applicata solo quando la data ufficiale è domenica:
-    eventuali turni infrasettimanali restano quindi invariati.
+    1) A./R. nel calendario = data ufficiale fissata dalla delegazione.
+    2) Se la colonna Giorno della squadra di casa è vuota:
+       la data A./R. resta invariata.
+    3) Se Giorno = Sabato o Domenica e la data ufficiale è nel weekend:
+       - ufficiale Sabato + Giorno Domenica -> +1 giorno
+       - ufficiale Domenica + Giorno Sabato -> -1 giorno
+       - se il giorno coincide -> nessuna modifica.
+    4) I turni infrasettimanali restano sulla data ufficiale A./R.
+       anche se la società ha un giorno abituale indicato nella tabella.
     """
     try:
         dt = datetime.strptime(match.date, '%d/%m/%Y')
@@ -1327,16 +1329,37 @@ def adjusted_match_date(section, match):
         return match.date
 
     info = section.teams.get(match.home)
-    day = clean(info.day) if info else ''
+    declared_day = clean(info.day) if info else ''
 
-    # Python: lun=0 ... dom=6
-    if dt.weekday() == 6:
-        if day == 'SABATO':
-            from datetime import timedelta
-            dt = dt - timedelta(days=1)
-        elif day in {'VENERDI', 'VENERDI'}:
-            from datetime import timedelta
-            dt = dt - timedelta(days=2)
+    # Nessun giorno dichiarato: prevale integralmente A./R.
+    if not declared_day:
+        return dt.strftime('%d/%m/%Y')
+
+    # Normalizzazione.
+    declared_day = (
+        declared_day
+        .replace('Ì', 'I')
+        .replace('Í', 'I')
+        .replace('È', 'E')
+    )
+
+    # Python: lun=0 ... sab=5, dom=6.
+    wd = dt.weekday()
+
+    # La correzione riguarda esclusivamente il weekend.
+    # Un turno infrasettimanale è una data speciale fissata dalla delegazione.
+    if wd not in (5, 6):
+        return dt.strftime('%d/%m/%Y')
+
+    from datetime import timedelta
+
+    if declared_day == 'SABATO':
+        if wd == 6:          # domenica ufficiale -> sabato precedente
+            dt -= timedelta(days=1)
+
+    elif declared_day == 'DOMENICA':
+        if wd == 5:          # sabato ufficiale -> domenica successiva
+            dt += timedelta(days=1)
 
     return dt.strftime('%d/%m/%Y')
 
