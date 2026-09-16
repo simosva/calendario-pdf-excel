@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-PARSER_VERSION = "2.8-weekend-day-alignment"
+PARSER_VERSION = "2.9-address-normalization"
 
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
@@ -1273,9 +1273,127 @@ def parse_docx(path):
 # STREAMLIT APP
 # ============================================================
 
+def normalize_locality_for_excel(value):
+    """Normalizza la località senza alterarne il significato."""
+    s = clean(value)
+    if not s:
+        return ''
+
+    # Spaziatura di abbreviazioni frequenti.
+    s = re.sub(r'\bLOC\.\s*', 'LOC. ', s)
+    s = re.sub(r'\bFRAZ\.\s*', 'FRAZ. ', s)
+    s = re.sub(r'\bQ\.?\s*RE\b', 'Q.RE', s)
+
+    # Punteggiatura/spazi.
+    s = re.sub(r'\s*,\s*', ', ', s)
+    s = re.sub(r'\s+', ' ', s).strip(' ,-')
+    return s
+
+
+def normalize_street_address(value, locality=''):
+    """
+    Normalizza l'indirizzo per l'Excel.
+
+    Esempi:
+      VIA ROMA N. 11 ROMA  -> VIA ROMA, 11
+      VIA ROMA11 ,ROMA     -> VIA ROMA, 11
+      P.ZA GARIBALDI 5     -> PIAZZA GARIBALDI, 5
+      V.LE DELLO SPORT 27  -> VIALE DELLO SPORT, 27
+
+    La località viene aggiunta separatamente da indirizzo_excel().
+    """
+    s = clean(value)
+    loc = normalize_locality_for_excel(locality)
+
+    if not s:
+        return ''
+
+    # Uniforma alcune abbreviazioni stradali comuni.
+    replacements = [
+        (r'^\s*P\.?\s*ZA\.?\s+', 'PIAZZA '),
+        (r'^\s*P\.?\s*ZZA\.?\s+', 'PIAZZA '),
+        (r'^\s*P\.?\s*LE\.?\s+', 'PIAZZALE '),
+        (r'^\s*V\.?\s*LE\.?\s+', 'VIALE '),
+        (r'^\s*C\.?\s*SO\.?\s+', 'CORSO '),
+        (r'^\s*L\.?\s*GO\.?\s+', 'LARGO '),
+    ]
+    for pat, rep in replacements:
+        s = re.sub(pat, rep, s)
+
+    # Uniforma indicatori interni.
+    s = re.sub(r'\bANG\.\s*', 'ANG. ', s)
+    s = re.sub(r'\bLOC\.\s*', 'LOC. ', s)
+    s = re.sub(r'\bFRAZ\.\s*', 'FRAZ. ', s)
+
+    # Se numero e parola sono attaccati: ROMA11 -> ROMA 11.
+    # Limitato ai casi in cui le cifre sono in fondo o prima della località.
+    s = re.sub(r'([A-ZÀ-Ý])(\d{1,4}(?:/[A-Z0-9]+)?)\b', r'\1 \2', s)
+
+    # Togli la località se è stata inglobata alla fine dell'indirizzo.
+    # Gestisce "VIA ROMA 11, ROMA" e "VIA ROMA 11 ROMA".
+    if loc:
+        loc_re = re.escape(loc)
+        s = re.sub(rf'\s*,?\s*{loc_re}\s*$', '', s, flags=re.I).strip()
+
+    # Uniforma "N. 11", "N°11", "N 11" prima del civico.
+    s = re.sub(
+        r'\s+(?:N\.?|N°|NR\.?|NUM\.?)\s*(\d+[A-Z]?(?:/[A-Z0-9]+)?)\b',
+        r' \1',
+        s
+    )
+
+    # Virgole e spazi.
+    s = re.sub(r'\s*,\s*', ', ', s)
+    s = re.sub(r'\s+', ' ', s).strip(' ,')
+
+    # SNC/S.N.C. = nessun numero civico: lo conserviamo ma senza virgola.
+    s = re.sub(r'\bS\.?\s*N\.?\s*C\.?\b', 'SNC', s)
+
+    # Cerca il civico finale, eventualmente seguito da una nota tra parentesi
+    # o da una denominazione tra virgolette.
+    # Esempi: "VIA ROMA 11", "VIA ROMA 11/A", "VIA ... 162 (DEROGA)".
+    m = re.match(
+        r'^(.*?)(?:,\s*|\s+)'
+        r'(\d+[A-Z]?(?:[/\-]\d+[A-Z]?)?(?:/[A-Z])?)'
+        r'(\s*(?:\([^)]*\)|"[^"]*")\s*)?$',
+        s
+    )
+
+    if m:
+        street = m.group(1).strip(' ,')
+        civic = m.group(2).strip()
+        suffix = (m.group(3) or '').strip()
+
+        # Evita di interpretare come civico un numero che fa parte
+        # del solo nome della strada se manca un vero nome precedente.
+        if street:
+            s = f"{street}, {civic}"
+            if suffix:
+                s += f" {suffix}"
+
+    # Se esiste già una virgola prima del civico, standardizzala.
+    s = re.sub(
+        r',\s*(\d+[A-Z]?(?:[/\-]\d+[A-Z]?)?(?:/[A-Z])?)\b',
+        r', \1',
+        s
+    )
+
+    # SNC non deve avere una virgola davanti.
+    s = re.sub(r',\s*SNC\b', ' SNC', s)
+
+    return s.strip(' ,-')
+
+
 def indirizzo_excel(match):
-    addr=clean(match.address)
-    loc=clean(match.locality)
+    """
+    Formato finale:
+      VIA / PIAZZA / VIALE ..., CIVICO - CITTÀ
+    oppure, senza civico:
+      VIA / PIAZZA / VIALE ... - CITTÀ
+    """
+    loc = normalize_locality_for_excel(match.locality)
+    addr = normalize_street_address(match.address, loc)
+
     if addr and loc:
         return f"{addr} - {loc}"
     return addr or loc
