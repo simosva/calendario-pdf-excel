@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-PARSER_VERSION = "2.9-address-normalization"
+PARSER_VERSION = "3.0-rotated-table-fix"
 
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
@@ -556,7 +556,145 @@ def smart_canonical_team(name, teams):
     return best if best_score>=.66 else None
 
 
+def parse_modern_field_table_grid(page):
+    """
+    Parser primario per le tabelle moderne CRL/LND.
+
+    Usa la griglia reale della tabella PDF tramite PyMuPDF invece delle
+    coordinate assolute del testo. Questo rende la lettura indipendente da:
+    - pagina internamente ruotata di 90/180/270 gradi;
+    - intestazione "Campo/Località" oppure "Campo / Località";
+    - larghezze diverse delle colonne.
+
+    Restituisce TeamInfo con Società, Campo/Località, Indirizzo, Orario, Giorno.
+    """
+    try:
+        finder = page.find_tables()
+        tables = getattr(finder, 'tables', []) or []
+    except Exception:
+        return {}
+
+    best = {}
+
+    for table in tables:
+        try:
+            data = table.extract()
+        except Exception:
+            continue
+
+        if not data or len(data) < 2:
+            continue
+
+        header_idx = None
+        header = None
+
+        for ri, row in enumerate(data[:4]):
+            if not row:
+                continue
+            vals = [clean(c or '') for c in row]
+            joined = ' | '.join(vals)
+            if (
+                'SOCIETA' in joined
+                and 'CAMPO' in joined
+                and 'INDIRIZZO' in joined
+            ):
+                header_idx = ri
+                header = vals
+                break
+
+        if header_idx is None:
+            continue
+
+        def idx_for(kind):
+            for i, value in enumerate(header):
+                v = clean(value)
+                if kind == 'soc' and v.startswith('SOCIETA'):
+                    return i
+                if kind == 'code' and v in {'N.', 'N'}:
+                    return i
+                if kind == 'field' and v.startswith('CAMPO'):
+                    return i
+                if kind == 'addr' and v.startswith('INDIRIZZO'):
+                    return i
+                if kind == 'time' and v.startswith('ORARIO'):
+                    return i
+                if kind == 'day' and v.startswith('GIORNO'):
+                    return i
+            return None
+
+        i_soc = idx_for('soc')
+        i_code = idx_for('code')
+        i_field = idx_for('field')
+        i_addr = idx_for('addr')
+        i_time = idx_for('time')
+        i_day = idx_for('day')
+
+        if None in (i_soc, i_code, i_field, i_addr):
+            continue
+
+        teams = {}
+
+        for row in data[header_idx + 1:]:
+            if not row:
+                continue
+
+            def get_cell(idx):
+                if idx is None:
+                    return ''
+                # In alcuni PDF ruotati PyMuPDF inserisce colonne vuote
+                # attorno alle celle: l'intestazione può risultare in i,
+                # mentre il valore della riga è in i-1. Cerchiamo quindi
+                # la cella non vuota più vicina entro una posizione.
+                candidates = []
+                for pos in (idx, idx - 1, idx + 1):
+                    if 0 <= pos < len(row):
+                        value = clean(row[pos] or '')
+                        if value:
+                            candidates.append((abs(pos - idx), pos, value))
+                if not candidates:
+                    return ''
+                candidates.sort(key=lambda z: (z[0], z[1]))
+                return candidates[0][2]
+
+            name = get_cell(i_soc)
+            code = get_cell(i_code)
+            fieldloc = get_cell(i_field)
+            address = get_cell(i_addr)
+            tm = normalize_time(get_cell(i_time))
+            day_raw = get_cell(i_day)
+
+            if not name or not re.fullmatch(r'\d{1,5}', code):
+                continue
+
+            if name.startswith('SOCIETA') or name.startswith('LA SOCIETA'):
+                continue
+
+            # Giorno: conserviamo solo i valori realmente dichiarati.
+            day = ''
+            if day_raw in {'SABATO', 'DOMENICA', 'VENERDI', 'VENERDÌ'}:
+                day = day_raw.title()
+
+            teams[name] = TeamInfo(
+                name=name,
+                locality=extract_locality_from_field(fieldloc),
+                address=address,
+                time=tm,
+                field_name=fieldloc,
+                day=day,
+            )
+
+        if len(teams) > len(best):
+            best = teams
+
+    return best
+
+
 def parse_modern_field_table_words_v2(page):
+    # Prima scelta: griglia reale della tabella PDF.
+    grid_teams = parse_modern_field_table_grid(page)
+    if len(grid_teams) >= 4:
+        return grid_teams
+
     """
     Legge le tabelle CRL/LND moderne:
     Società | N. | Campo / Località | Indirizzo | Orario | Giorno.
