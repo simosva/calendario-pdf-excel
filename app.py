@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-PARSER_VERSION = "3.0-rotated-table-fix"
+PARSER_VERSION = "3.2-acronym-verified"
 
 MONTHS = {
     'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
@@ -522,38 +522,166 @@ def _team_base_key(name):
     return re.sub(r'[^A-Z0-9]+','',s)
 
 
+def _squad_suffix_key(name):
+    """Restituisce SQB/SQC/... se presente, altrimenti stringa vuota."""
+    c = clean(name)
+    m = re.search(r'\bSQ\.?\s*([A-Z])\b', c)
+    return f"SQ{m.group(1)}" if m else ''
+
+
+def _leading_acronym(name):
+    """
+    Riconosce sigle iniziali come:
+      F. O. R. sq.B
+      F.O.R. SQ.B
+      A.C. ...
+    Restituisce la sigla senza punti, es. FOR.
+    """
+    c = clean(name)
+
+    # Variante con punti: F. O. R. / F.O.R.
+    letters = re.findall(r'(?<![A-Z])([A-Z])\.', c)
+    if len(letters) >= 2:
+        # Considera solo la sequenza di sigle iniziale.
+        prefix = re.match(r'^\s*((?:[A-Z]\.\s*){2,8})', c)
+        if prefix:
+            p_letters = re.findall(r'([A-Z])\.?', prefix.group(1))
+            if len(p_letters) >= 2:
+                return ''.join(p_letters)
+
+    return ''
+
+
+def _candidate_initials(name):
+    """
+    Genera le iniziali significative del nome completo squadra.
+    Esempio:
+      FALOPPIESE OLGIATE RO. sq.B -> FOR
+    """
+    c = clean(name)
+    # Togli la parte squadra B/C... e le forme societarie finali.
+    c = re.sub(r'\bSQ\.?\s*[A-Z]\b.*$', '', c).strip()
+    c = re.sub(
+        r'\b(?:A\.?S\.?D\.?|S\.?S\.?D\.?|S\.?R\.?L\.?|A\.?R\.?L\.?|'
+        r'F\.?B\.?C\.?|POL\.?D\.?|POL\.?)\b.*$',
+        '',
+        c
+    ).strip()
+
+    tokens = re.findall(r'[A-Z0-9]+', c)
+    if not tokens:
+        return ''
+
+    # Prefissi societari molto comuni che non fanno parte della sigla "parlante".
+    # Non vengono sempre eliminati: produciamo sia la forma completa sia quella
+    # senza prefisso e scegliamo poi nel confronto.
+    return ''.join(tok[0] for tok in tokens if tok)
+
+
+def _acronym_candidate_score(query_name, candidate_name):
+    """
+    Match generico sigla -> nome esteso.
+    Non contiene nomi squadra hardcoded.
+    """
+    acr = _leading_acronym(query_name)
+    if len(acr) < 2:
+        return 0.0
+
+    cand = _candidate_initials(candidate_name)
+    if not cand:
+        return 0.0
+
+    # La sigla deve combaciare esattamente con le iniziali o esserne
+    # una parte iniziale molto credibile.
+    if cand == acr:
+        score = 1.0
+    elif len(acr) >= 3 and cand.startswith(acr):
+        score = 0.94
+    else:
+        return 0.0
+
+    # Se il calendario specifica SQ.B / SQ.C ecc., deve coincidere.
+    q_sq = _squad_suffix_key(query_name)
+    c_sq = _squad_suffix_key(candidate_name)
+    if q_sq:
+        if c_sq != q_sq:
+            return 0.0
+        score += 0.03
+
+    return min(score, 1.0)
+
+
 def smart_canonical_team(name, teams):
     """Associa il nome abbreviato del calendario alla riga corretta della tabella campi."""
-    c=clean(name)
-    # Nei calendari CRL "AC." / "ACC." è spesso abbreviazione di ACADEMY/ACCADEMIA.
-    ab=re.match(r'^(?:ACC?\.)\s*(.+)$',c)
-    if ab:
-        rem=_team_base_key(ab.group(1)); candidates=[]
-        for t in teams:
-            mt=re.match(r'^(?:ACADEMY|ACCADEMIA)\s+(.+)$',clean(t))
-            if mt:
-                sc=SequenceMatcher(None,rem,_team_base_key(mt.group(1))).ratio()
-                candidates.append((sc,t))
-        if candidates:
-            sc,t=max(candidates)
-            if sc>=.72:
-                return t
+    c = clean(name)
 
-    q=_team_base_key(name)
-    exact=[t for t in teams if _team_base_key(t)==q]
-    if len(exact)==1:
+    # 1) Match esatto normalizzato.
+    q = _team_base_key(name)
+    exact = [t for t in teams if _team_base_key(t) == q]
+    if len(exact) == 1:
         return exact[0]
 
-    best=None; best_score=0
+    # 2) Nei calendari CRL "AC." / "ACC." è spesso abbreviazione
+    #    di ACADEMY / ACCADEMIA.
+    ab = re.match(r'^(?:ACC?\.)\s*(.+)$', c)
+    if ab:
+        rem = _team_base_key(ab.group(1))
+        candidates = []
+        for t in teams:
+            mt = re.match(r'^(?:ACADEMY|ACCADEMIA)\s+(.+)$', clean(t))
+            if mt:
+                sc = SequenceMatcher(
+                    None,
+                    rem,
+                    _team_base_key(mt.group(1))
+                ).ratio()
+                candidates.append((sc, t))
+        if candidates:
+            sc, t = max(candidates)
+            if sc >= .72:
+                return t
+
+    # 3) Sigle iniziali generiche:
+    #    F. O. R. sq.B -> FALOPPIESE OLGIATE RO. sq.B
+    acronym_matches = []
     for t in teams:
-        k=_team_base_key(t)
-        sc=SequenceMatcher(None,q,k).ratio()
-        if len(q)>=5 and (q in k or k in q):
-            extra=abs(len(q)-len(k))
-            sc=max(sc,.93-min(.20,extra*.01))
-        if sc>best_score:
-            best,best_score=t,sc
-    return best if best_score>=.66 else None
+        sc = _acronym_candidate_score(name, t)
+        if sc > 0:
+            acronym_matches.append((sc, t))
+
+    if acronym_matches:
+        acronym_matches.sort(reverse=True)
+        best_sc, best_team = acronym_matches[0]
+
+        # Accetta solo se non c'è ambiguità con un secondo candidato equivalente.
+        if len(acronym_matches) == 1:
+            return best_team
+        second_sc = acronym_matches[1][0]
+        if best_sc - second_sc >= .05:
+            return best_team
+
+    # 4) Fuzzy fallback già usato nelle versioni precedenti.
+    best = None
+    best_score = 0
+    for t in teams:
+        k = _team_base_key(t)
+        sc = SequenceMatcher(None, q, k).ratio()
+
+        if len(q) >= 5 and (q in k or k in q):
+            extra = abs(len(q) - len(k))
+            sc = max(sc, .93 - min(.20, extra * .01))
+
+        # Se entrambe hanno una squadra B/C dichiarata ma diversa,
+        # non consentire un fuzzy match scorretto.
+        q_sq = _squad_suffix_key(name)
+        t_sq = _squad_suffix_key(t)
+        if q_sq and t_sq and q_sq != t_sq:
+            sc = 0
+
+        if sc > best_score:
+            best, best_score = t, sc
+
+    return best if best_score >= .66 else None
 
 
 def parse_modern_field_table_grid(page):
