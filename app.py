@@ -1,280 +1,704 @@
-import io
-import os
-import re
-import tempfile
-import unicodedata
-import statistics
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from difflib import SequenceMatcher
-from pathlib import Path
-
-import fitz
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
+import tempfile
+import os
 
-PARSER_VERSION = "4.0-regression-tested"
+import re, io, unicodedata, statistics
+from dataclasses import dataclass, field
+from datetime import datetime
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
 
+import fitz
+import cv2
+import numpy as np
+import pytesseract
 
-# ============================================================
-# MODELLI DATI
-# ============================================================
+PARSER_VERSION = "3.3-riposo-excel"
+
+MONTHS = {
+    'GEN':1,'GENNAIO':1,'FEB':2,'FEBBRAIO':2,'MAR':3,'MARZO':3,'APR':4,'APRILE':4,
+    'MAG':5,'MAGGIO':5,'GIU':6,'GIUGNO':6,'LUG':7,'LUGLIO':7,'AGO':8,'AGOSTO':8,
+    'SET':9,'SETT':9,'SETTEMBRE':9,'OTT':10,'OTTOBRE':10,'NOV':11,'NOVEMBRE':11,'DIC':12,'DICEMBRE':12
+}
+
+def clean(s):
+    s=(s or '').replace('\u00a0',' ')
+    s=unicodedata.normalize('NFKD',s)
+    s=''.join(c for c in s if not unicodedata.combining(c))
+    s=s.upper().replace('’',"'").replace('`',"'")
+    s=re.sub(r'\s+',' ',s).strip(' |\t\r\n')
+    return s
+
+def key(s):
+    s=clean(s)
+    s=re.sub(r'[^A-Z0-9]+','',s)
+    return s
+
+def ratio(a,b):
+    a,b=key(a),key(b)
+    if not a or not b: return 0
+    if a==b:return 1.0
+    if len(a)>=5 and (a in b or b in a): return 0.96
+    return SequenceMatcher(None,a,b).ratio()
+
+def normalize_time(t):
+    t=clean(t).replace('.',':')
+    m=re.search(r'\b([0-2]?\d):([0-5]\d)\b',t)
+    if not m:return ''
+    h=int(m.group(1))
+    if h>23:return ''
+    return f'{h:02d}:{m.group(2)}'
+
+def normalize_numeric_date(s):
+    m=re.search(r'\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b',s)
+    if not m:return ''
+    d,mn,y=map(int,m.groups())
+    if y<100:y+=2000
+    try:return datetime(y,mn,d).strftime('%d/%m/%Y')
+    except:return ''
+
+def season_years(text):
+    m=re.search(r'STAGIONE\s+(\d{4})\s*[-/]\s*(\d{4})', clean(text))
+    if m:return int(m.group(1)),int(m.group(2))
+    years=[int(x) for x in re.findall(r'20\d{2}',text)]
+    if years:
+        y=min(years); return y,y+1
+    return datetime.now().year, datetime.now().year+1
+
+def date_from_day_month(day, mon, y1,y2, phase=''):
+    monu=clean(mon).replace('.','')
+    month=MONTHS.get(monu[:3], MONTHS.get(monu))
+    if not month:return ''
+    # football season: Aug-Dec in first year, Jan-Jun in second year
+    year = y1 if month>=7 else y2
+    if 'PRIMAVERILE' in clean(phase): year=y2
+    try:return datetime(year,month,int(day)).strftime('%d/%m/%Y')
+    except:return ''
+
+def parse_textual_dates(line,y1,y2,phase=''):
+    # Numeric dates first
+    nums=re.findall(r'\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b',line)
+    if nums:return [normalize_numeric_date(x) for x in nums]
+    vals=[]
+    for d,m in re.findall(r'\b(\d{1,2})\s+([A-Za-zÀ-ÿ]{3,10})\b',line):
+        dt=date_from_day_month(d,m,y1,y2,phase)
+        if dt:vals.append(dt)
+    return vals
 
 @dataclass
 class TeamInfo:
-    name: str
-    locality: str = ""
-    address: str = ""
-    time: str = ""
-    field_name: str = ""
-    day: str = ""
-
+    name:str
+    locality:str=''
+    address:str=''
+    time:str=''
+    field_name:str=''
+    day:str=''
 
 @dataclass
 class Match:
-    date: str
-    home: str
-    away: str
-    time: str = ""
-    locality: str = ""
-    address: str = ""
-    round_no: str = ""
-
+    date:str
+    home:str
+    away:str
+    time:str=''
+    locality:str=''
+    address:str=''
+    round_no:str=''
 
 @dataclass
 class Section:
-    competition: str
-    group: str
-    teams: dict
-    matches: list
-    source_format: str
+    competition:str
+    group:str
+    teams:Dict[str,TeamInfo]=field(default_factory=dict)
+    matches:List[Match]=field(default_factory=list)
+    source_format:str=''
 
     @property
     def label(self):
-        bits = [x for x in [self.competition, (f"GIRONE {self.group}" if self.group else "")] if x]
-        return " - ".join(bits) if bits else "CALENDARIO"
+        g=f' - Girone {self.group}' if self.group else ''
+        return f'{self.competition}{g}'.strip()
 
 
-# ============================================================
-# NORMALIZZAZIONE BASE
-# ============================================================
 
-def clean(value):
-    value = (value or "").replace("\u00a0", " ")
-    value = unicodedata.normalize("NFKD", value)
-    value = "".join(c for c in value if not unicodedata.combining(c))
-    value = value.upper().replace("’", "'").replace("`", "'")
-    value = re.sub(r"\s+", " ", value).strip(" |\t\r\n")
-    return value
+def parse_field_table_words(page):
+    """Parse LND field tables from positioned PDF words (robust to broken text order)."""
+    words=page.get_text('words')
+    if not words:return {}
+    hdr={}
+    for w in words:
+        txt=clean(w[4])
+        if txt.startswith('SOCIETA') and 'soc' not in hdr: hdr['soc']=w[0]
+        elif txt.startswith('CAMPO') and 'code' not in hdr: hdr['code']=w[0]
+        elif txt.startswith('DENOMINAZIONE') and 'field' not in hdr: hdr['field']=w[0]
+        elif txt.startswith('LOCALITA') and 'loc' not in hdr: hdr['loc']=w[0]
+        elif txt=='ORA' and 'time' not in hdr: hdr['time']=w[0]
+        elif txt.startswith('INDIRIZZO') and 'addr' not in hdr: hdr['addr']=w[0]
+    if not all(k in hdr for k in ['soc','code','field','loc','time','addr']): return {}
+    # vertical separator glyphs from the ASCII-style table
+    barxs=[]
+    for w in words:
+        if w[4].strip()=='|':barxs.append(w[0])
+    clusters=[]
+    for x in sorted(barxs):
+        if not clusters or abs(x-clusters[-1][0])>1.5:clusters.append([x,1])
+        else:
+            clusters[-1][0]=(clusters[-1][0]*clusters[-1][1]+x)/(clusters[-1][1]+1);clusters[-1][1]+=1
+    common=[x for x,n in clusters if n>=5]
+    def left_bar(x,default):
+        vals=[b for b in common if b<x]
+        return max(vals) if vals else default
+    soc_left=left_bar(hdr['soc'],hdr['soc']-10)
+    code_left=left_bar(hdr['code'],hdr['code']-10)
+    field_left=left_bar(hdr['field'],hdr['field']-10)
+    loc_left=hdr['loc']-1
+    time_left=left_bar(hdr['time'],hdr['time']-12)
+    addr_left=left_bar(hdr['addr'],hdr['addr']-10)
+    # end after address; first common bar to the right, otherwise page edge
+    right=[b for b in common if b>addr_left+20]
+    addr_right=min(right) if right else page.rect.width+1
+    bounds=[soc_left,code_left,field_left,loc_left,time_left,addr_left,addr_right]
+    header_y=max(w[1] for w in words if clean(w[4]).startswith(('SOCIETA','DENOMINAZIONE','LOCALITA','INDIRIZZO')))
+    data=[w for w in words if w[1]>header_y+4]
+    groups=[]
+    for w in sorted(data,key=lambda x:((x[1]+x[3])/2,x[0])):
+        yc=(w[1]+w[3])/2
+        if not groups or abs(yc-groups[-1][0])>2.8:groups.append([yc,[w]])
+        else:groups[-1][1].append(w);groups[-1][0]=(groups[-1][0]+yc)/2
+    teams={}
+    for yc,ws in groups:
+        cols=[]
+        for a,b in zip(bounds,bounds[1:]):
+            arr=sorted([w for w in ws if a+0.2<=w[0]<b-0.2 and w[4].strip()!='|'],key=lambda w:w[0])
+            cols.append(clean(' '.join(w[4] for w in arr)))
+        name,code,fieldname,locality,tm,addr=cols
+        if not name or not re.fullmatch(r'\d{1,5}',code):continue
+        if name.startswith('SOCIETA'):continue
+        teams[name]=TeamInfo(name,locality,addr,normalize_time(tm),fieldname)
+    return teams
 
+# ---------- field table text parser ----------
+def parse_header_comp_group(text):
+    t=clean(text)
+    # Try GIRONE: X
+    gm=re.search(r'(.{3,120}?)\s+GIRONE\s*:\s*([A-Z0-9]+)',t)
+    if gm:
+        comp=gm.group(1)
+        comp=re.sub(r'^.*?LOMBARDIA\s*','',comp).strip(' *|-')
+        return comp,gm.group(2)
+    gm=re.search(r'GIRONE\s+([A-Z0-9]+)',t)
+    group=gm.group(1) if gm else ''
+    # graphical header lines
+    lines=[clean(x) for x in text.splitlines() if clean(x)]
+    comp=''
+    for ln in lines[:10]:
+        if any(w in ln for w in ['CALENDARIO','STAGIONE','GIRONE','COMITATO','LOMBARDIA']): continue
+        if len(ln)>3:
+            comp=ln; break
+    return comp,group
 
-def normalize_time(value):
-    s = clean(value).replace(".", ":")
-    m = re.search(r"\b([0-2]?\d):([0-5]\d)\b", s)
-    if not m:
-        return ""
-    h = int(m.group(1))
-    if h > 23:
-        return ""
-    return f"{h:02d}:{m.group(2)}"
+def parse_field_table_text(text):
+    teams={}
+    lines=text.splitlines()
+    # regular aligned rows
+    for ln in lines:
+        if '|' not in ln: continue
+        cells=[c.strip() for c in ln.split('|')]
+        # keep internal blanks but strip edge blanks
+        while cells and not cells[0]:cells.pop(0)
+        while cells and not cells[-1]:cells.pop()
+        if len(cells)<5:continue
+        name=clean(cells[0])
+        code=clean(cells[1])
+        if not re.fullmatch(r'\d{1,5}',code):continue
+        fieldloc=clean(cells[2])
+        tm=normalize_time(cells[3])
+        addr=clean(cells[4])
+        if not name or name in ["SOCIETA'",'SOCIETA']:continue
+        locality=extract_locality_from_field(fieldloc)
+        day=''
+        for extra in cells[5:]:
+            ce=clean(extra)
+            if ce in {'SABATO','DOMENICA','VENERDI','VENERDÌ'}:
+                day=ce.title()
+                break
+        teams[name]=TeamInfo(name,locality,addr,tm,fieldloc,day)
+    return teams
 
-
-def normalize_numeric_date(value):
-    m = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b", value or "")
-    if not m:
-        return ""
-    d, mo, y = map(int, m.groups())
-    if y < 100:
-        y += 2000
-    try:
-        return datetime(y, mo, d).strftime("%d/%m/%Y")
-    except ValueError:
-        return ""
-
-
-def sort_date_value(value):
-    try:
-        return datetime.strptime(value, "%d/%m/%Y")
-    except Exception:
-        return datetime.max
-
-
-# ============================================================
-# LOCALITA' / INDIRIZZI
-# ============================================================
-
-LEGAL_PATTERNS = [
-    r"S\.?S\.?D\.?\s*A\.?\s*R\.?\s*L\.?$", r"SSD\s*A\s*R\s*L$", r"S\.?S\.?D\.?$",
-    r"SSD(?:ARL|RL)?$", r"A\.?S\.?D\.?$", r"ASD$", r"U\.?S\.?D\.?$", r"USD$",
-    r"G\.?S\.?D\.?$", r"GSD$", r"A\.?D\.?P\.?$", r"ADP$", r"S\.?R\.?L\.?$", r"SRL$",
-    r"A\.?\s*R\.?\s*L\.?$", r"ARL$", r"C\.?V\.?$", r"F\.?B\.?C\.?$", r"POL\.?D\.?$", r"POL\.?$",
-]
-
-
-def split_squad_suffix(name):
-    """Riconosce SQ.B anche se attaccato: BREGNANESESQ.B / A.S.DSQ.B."""
-    s = clean(name)
-    m = re.search(r"SQ\.?\s*([A-Z])\b", s)
-    suffix = f"SQ{m.group(1)}" if m else ""
-    s = re.sub(r"SQ\.?\s*[A-Z]\b", "", s).strip()
-    return s, suffix
-
-
-def strip_legal_suffix(name):
-    s, sq = split_squad_suffix(name)
-    # A.C.D. davanti al nome è una forma societaria, non parte del nome.
-    s = re.sub(r"^(?:A\.?\s*C\.?\s*D\.?|A\.?C\.?D\.?)\s*", "", s).strip()
-    changed = True
-    while changed:
-        changed = False
-        for pattern in LEGAL_PATTERNS:
-            ns = re.sub(r"\s*\b" + pattern, "", s).strip(" .-")
-            if ns != s:
-                s = ns
-                changed = True
-    return s, sq
-
-
-def extract_locality_from_field(field, team_name=""):
-    """Estrae la località dalla colonna Campo/Località, inclusi PDF senza ' - '."""
-    s = clean(field)
-    if not s:
-        return ""
-
-    # Separatore esplicito con o senza spazi.
-    parts = [p.strip() for p in re.split(r"\s*-\s*", s) if p.strip()]
-    if len(parts) >= 2:
-        tail = parts[-1]
-        tail = re.sub(r"^CAMPO\s+(?:N\.?\s*)?[A-Z0-9]+\s+", "", tail).strip()
-        return tail
-
-    # Località dopo (E.A), (E.A.) ecc.
-    m = re.search(r"\)\s*([A-Z0-9' .]+)$", s)
+def extract_locality_from_field(s):
+    s=clean(s)
+    if not s:return ''
+    # Common explicit dash separator used in modern graphical tables
+    parts=[p.strip() for p in re.split(r'\s+-\s+',s) if p.strip()]
+    if len(parts)>=2:
+        return parts[-1]
+    # remove quoted venue names and parentheticals
+    x=re.sub(r'"[^"]+"', ' ', s)
+    x=re.sub(r'\([^)]*\)', ' ', x)
+    x=re.sub(r'\bE\.?A\.?\b',' ',x)
+    # if there is CAMPO N... take suffix
+    m=list(re.finditer(r'\bCAMPO\s*(?:N\.?\s*)?[0-9A-Z°.-]*\s*',x))
     if m:
-        tail = clean(m.group(1)).strip(" -")
-        if tail:
-            return tail
+        cand=x[m[-1].end():].strip(' -')
+        if cand and not re.match(r'^\d',cand): return cand
+    # remove common facility prefixes
+    x=re.sub(r'^(?:C\.?S\.?|CENTRO SPORTIVO|CENTRO SPOTIVO|CAMPO SPORTIVO|STADIO|COMUNALE|ORATORIO|PARROCCHIALE|C\.COM\.|C\.S\.COMUNALE)[ .-]*','',x)
+    x=re.sub(r'^(?:COMUNALE|SPORTIVO|N\.?\s*\d+|CAMPO\s*\d+)[ .-]*','',x)
+    # after final explicit N.1 / N.2 often locality follows
+    m=re.search(r'\bN\.?\s*\d+\s+(.+)$',x)
+    if m:return m.group(1).strip(' -')
+    # If text starts with generic facility words, take last 1-4 words; preserve LOC/FRAZ/RIONE contexts
+    words=x.split()
+    generic={'C.S.','CS','COMUNALE','CENTRO','SPORTIVO','SPORT.','CAMPO','STADIO','ORATORIO','PARROCCHIALE','DI','N.1','N.2','N.3'}
+    while words and words[0] in generic: words.pop(0)
+    if len(words)<=4:return ' '.join(words)
+    # prefer suffix after LOC./FRAZ. if present, otherwise last 2 words
+    for marker in ['LOC.','FRAZ.','RIONE']:
+        if marker in words:
+            i=words.index(marker)
+            return ' '.join(words[max(0,i-2):])
+    return ' '.join(words[-2:])
 
-    # Località dopo E.A. non racchiuso tra parentesi.
-    m = re.search(r"\bE\.?\s*A\.?\s*([A-Z0-9' .]+)$", s)
-    if m:
-        tail = clean(m.group(1)).strip(" -")
-        if tail:
-            return tail
+# ---------- Simple graphical text calendar ----------
+def match_team_line(line, team_names, threshold=.80):
+    c=clean(line)
+    best=None;score=0
+    for t in team_names:
+        r=ratio(c,t)
+        if r>score:best,score=t,r
+    return best if score>=threshold else None
 
-    # Campo 1 / Campo N.2 / Campo A + località.
-    m = re.search(r"\bCAMPO\s+(?:N\.?\s*)?[A-Z0-9]+\s+(.+)$", s)
-    if m:
-        return clean(m.group(1)).strip(" -")
+def parse_simple_calendar(text,teams,competition,group):
+    y1,y2=season_years(text); phase=text
+    team_names=list(teams)
+    lines=[x.strip() for x in text.splitlines()]
+    matches=[]; i=0
+    while i<len(lines):
+        ln=clean(lines[i])
+        m=re.search(r'\b(\d+)\s*A?\s*GIORNATA\b',ln)
+        if not m:
+            i+=1;continue
+        round_no=m.group(1); i+=1
+        # date is next useful line with day/month
+        dates=[]
+        while i<len(lines) and not dates:
+            if re.search(r'\b\d+\s*A?\s*GIORNATA\b',clean(lines[i])):break
+            dates=parse_textual_dates(lines[i],y1,y2,phase)
+            i+=1
+        recog=[]; skip_rest=False
+        while i<len(lines):
+            cur=clean(lines[i])
+            if re.search(r'\b\d+\s*A?\s*GIORNATA\b',cur):break
+            if cur.startswith('RIPOSA'):
+                skip_rest=True; i+=1; continue
+            t=match_team_line(cur,team_names,.82)
+            if t:
+                if skip_rest:
+                    skip_rest=False
+                else:
+                    recog.append(t)
+            i+=1
+        for j in range(0,len(recog)-1,2):
+            home,away=recog[j],recog[j+1]
+            if dates:
+                ti=teams.get(home,TeamInfo(home)); matches.append(Match(dates[0],home,away,ti.time,ti.locality,ti.address,round_no))
+            if len(dates)>1:
+                ti=teams.get(away,TeamInfo(away)); matches.append(Match(dates[1],away,home,ti.time,ti.locality,ti.address,round_no))
+    return matches
 
-    # N.2 + località.
-    m = re.search(r"\bN\.?\s*\d+\s+(.+)$", s)
-    if m:
-        return clean(m.group(1)).strip(" -")
+# ---------- classic ascii calendar ----------
+def norm_box_delims(line):
+    line=line.replace('!', '|')
+    line=re.sub(r'(?<!\S)I(?!\S)', '|', line)
+    return line
 
-    # Forme semplici: C.S.COMUNALE GERENZANO / C.S.COMUNALE ROVELLASCA.
-    if '"' not in s and "(" not in s:
-        m = re.match(r"^(?:C\.?\s*S\.?\s*)?(?:CENTRO SPORTIVO\s+)?(?:COMUNALE|PARROCCHIALE)\s+(.+)$", s)
+def extract_box_matches(line):
+    # cell contents between visual box delimiters containing a match separator
+    line=norm_box_delims(line)
+    cells=re.findall(r'\|([^|]+)\|',line)
+    out=[]
+    for c in cells:
+        c=clean(c)
+        if 'RIPOSA' in c: continue
+        # separator requires whitespace around hyphen to avoid team hyphens
+        m=re.match(r'(.+?)\s+-\s+(.+)$',c)
         if m:
-            return clean(m.group(1)).strip(" -")
+            out.append((clean(m.group(1)),clean(m.group(2))))
+    return out
 
-    # Ultimo fallback: se il campo termina esattamente col nome squadra pulito.
-    base, _ = strip_legal_suffix(team_name)
-    base = clean(base)
-    if base and s.endswith(base):
-        return base
+def parse_classic_segment(text,teams):
+    # Do not parse the field-table portion as calendar rows.
+    cut=re.search(r'E\s*L\s*E\s*N\s*C\s*O\s+C\s*A\s*M\s*P\s*I', text, re.I)
+    if cut: text=text[:cut.start()]
+    lines=text.splitlines(); matches=[]; i=0
+    while i<len(lines):
+        line=norm_box_delims(lines[i])
+        if 'ANDATA:' not in line.upper(): i+=1;continue
+        # one or more A/R pairs in the line
+        pairs=[]
+        pat=re.compile(r'ANDATA:\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*\|.*?RITORNO:\s*(\d{0,2}/?\d{0,2}/?\d{0,4})',re.I)
+        for m in pat.finditer(line):
+            a=normalize_numeric_date(m.group(1)); r=normalize_numeric_date(m.group(2)) if m.group(2).strip('/') else ''
+            pairs.append([a,r,'','',''])
+        i+=1
+        if i>=len(lines):break
+        oreline=norm_box_delims(lines[i])
+        # parse each round number and times by cell slices
+        # use regex on each GIORNATA occurrence, taking nearest time before and after
+        gior=list(re.finditer(r'(\d+)\s*G\s*I\s*O\s*R\s*N\s*A\s*T\s*A',oreline,re.I))
+        times_all=[normalize_time(x) for x in re.findall(r'ORE\.*:\s*([0-9:.]*)',oreline,re.I)]
+        # Usually 2 times per column
+        for idx,p in enumerate(pairs):
+            if idx<len(gior): p[2]=gior[idx].group(1)
+            if len(times_all)>=2*(idx+1):
+                p[3],p[4]=times_all[2*idx],times_all[2*idx+1]
+        i+=1
+        # skip divider and collect rows until next data line
+        while i<len(lines) and 'ANDATA:' not in lines[i].upper():
+            if re.match(r'^\s*[.*-]{5,}',lines[i]):
+                # may be end block but keep scanning until next date
+                i+=1;continue
+            rowmatches=extract_box_matches(lines[i])
+            for idx,(home,away) in enumerate(rowmatches):
+                if idx>=len(pairs):continue
+                a,r,rn,ta,tr=pairs[idx]
+                # canonicalize names against fields if possible
+                home=canonical_team(home,teams) or home; away=canonical_team(away,teams) or away
+                ti=teams.get(home,TeamInfo(home))
+                matches.append(Match(a,home,away,ti.time or ta,ti.locality,ti.address,rn))
+                if r:
+                    ti2=teams.get(away,TeamInfo(away))
+                    matches.append(Match(r,away,home,ti2.time or tr,ti2.locality,ti2.address,rn))
+            i+=1
+    return matches
 
-    return ""
+def canonical_team(name,teams,threshold=.78):
+    if name in teams:return name
+    best=None;sc=0
+    for t in teams:
+        r=ratio(name,t)
+        if r>sc:best,sc=t,r
+    return best if sc>=threshold else None
+
+# ---------- graphical OCR helpers ----------
+def render_page(page,zoom=2):
+    pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),alpha=False)
+    img=np.frombuffer(pix.samples,dtype=np.uint8).reshape(pix.height,pix.width,pix.n)
+    if pix.n==4:return cv2.cvtColor(img,cv2.COLOR_RGBA2BGR)
+    return cv2.cvtColor(img,cv2.COLOR_RGB2BGR)
+
+def ocr_img(img,psm=6,whitelist=None):
+    if img.size==0:return ''
+    g=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+    g=cv2.resize(g,None,fx=2.5,fy=2.5,interpolation=cv2.INTER_CUBIC)
+    _,th=cv2.threshold(g,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    cfg=f'--oem 3 --psm {psm}'
+    if whitelist:cfg+=f' -c tessedit_char_whitelist={whitelist}'
+    try: txt=pytesseract.image_to_string(th,lang='ita',config=cfg)
+    except: txt=pytesseract.image_to_string(th,config=cfg)
+    return clean(txt)
+
+def direct_text_quality(text):
+    if not text:return 0
+    good=sum(ch.isascii() and (ch.isalnum() or ch.isspace() or ch in "-:./'()") for ch in text)
+    return good/max(1,len(text))
+
+def find_white_calendar_boxes(img):
+    H,W=img.shape[:2]; gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+    mask=cv2.inRange(gray,218,255)
+    mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,cv2.getStructuringElement(cv2.MORPH_RECT,(5,5)))
+    cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    rects=[]
+    for c in cnts:
+        x,y,w,h=cv2.boundingRect(c)
+        if .14*W<w<.27*W and .07*H<h<.22*H and .15*H<y<.92*H:
+            rects.append((x,y,w,h))
+    # cluster/sort row then x
+    rects=sorted(rects,key=lambda r:(round(r[1]/max(1,H*.04)),r[0]))
+    return rects
+
+def longest_regular_run(vals):
+    vals=sorted(set(vals))
+    if len(vals)<3:return vals
+    diffs=[b-a for a,b in zip(vals,vals[1:]) if 10<=b-a<=80]
+    if not diffs:return vals
+    med=statistics.median(diffs)
+    best=[];cur=[vals[0]]
+    for a,b in zip(vals,vals[1:]):
+        if abs((b-a)-med)<=4:
+            cur.append(b)
+        else:
+            if len(cur)>len(best):best=cur
+            cur=[b]
+    if len(cur)>len(best):best=cur
+    return best
+
+def parse_graphic_field_table(page):
+    """Parse modern graphical field table using dynamically detected row/column lines."""
+    img=render_page(page,2);H,W=img.shape[:2];gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+    bw=cv2.threshold(gray,205,255,cv2.THRESH_BINARY_INV)[1]
+    kh=cv2.getStructuringElement(cv2.MORPH_RECT,(max(40,W//20),1)); hl=cv2.morphologyEx(bw,cv2.MORPH_OPEN,kh)
+    cnts,_=cv2.findContours(hl,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE); ys=[]
+    for c in cnts:
+        x,y,w,h=cv2.boundingRect(c)
+        if w>.65*W and .12*H<y<.9*H:ys.append(y)
+    ys=longest_regular_run(ys)
+    if len(ys)<8:return {}
+    gap=int(round(statistics.median([b-a for a,b in zip(ys,ys[1:])])))
+    rowbounds=[ys[0]-gap]+ys
+    kv=cv2.getStructuringElement(cv2.MORPH_RECT,(1,max(40,H//15)));vl=cv2.morphologyEx(bw,cv2.MORPH_OPEN,kv)
+    cnts,_=cv2.findContours(vl,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE);xs=[]
+    for c in cnts:
+        x,y,w,h=cv2.boundingRect(c)
+        if h>.3*H and .1*H<y<.9*H:xs.append(x)
+    xs=sorted(set(xs))
+    if len(xs)<6:return {}
+    xs=xs[:6] if len(xs)==6 else xs[-6:]
+    teams={}
+    for ya,yb in zip(rowbounds,rowbounds[1:]):
+        if ya<0:continue
+        # One OCR call per complete row: much faster on Streamlit Cloud.
+        row=img[ya+1:yb-1,xs[0]:xs[-1]]
+        g=cv2.cvtColor(row,cv2.COLOR_BGR2GRAY)
+        g=cv2.resize(g,None,fx=3,fy=3,interpolation=cv2.INTER_CUBIC)
+        _,th=cv2.threshold(g,180,255,cv2.THRESH_BINARY)
+        try: raw=pytesseract.image_to_string(th,lang='ita',config='--psm 7')
+        except: raw=pytesseract.image_to_string(th,config='--psm 7')
+        parts=[clean(x) for x in raw.split('|') if clean(x)]
+        if len(parts)<3:continue
+        # Usually: name | code | field/locality | address | time
+        code_idx=None
+        for j,x in enumerate(parts):
+            if re.fullmatch(r'\d{1,5}',x):code_idx=j;break
+        if code_idx is None or code_idx==0:continue
+        name=parts[code_idx-1]
+        fieldloc=parts[code_idx+1] if code_idx+1<len(parts) else ''
+        rest=parts[code_idx+2:]
+        tm='';addr=''
+        for x in rest:
+            nt=normalize_time(x)
+            if nt:tm=nt
+            elif not addr:addr=x
+            else:addr+=' '+x
+        name=re.sub(r'^[^A-Z0-9]+','',name).strip()
+        if len(name)<3 or name.startswith('SOCIETA'):continue
+        locality=extract_locality_from_field(fieldloc)
+        teams[name]=TeamInfo(name,locality,addr,tm,fieldloc)
+    return teams
 
 
-def normalize_locality_for_excel(value):
-    s = clean(value)
-    if not s:
-        return ""
-    s = re.sub(r"\bLOC\.\s*", "LOC. ", s)
-    s = re.sub(r"\bFRAZ\.\s*", "FRAZ. ", s)
-    s = re.sub(r"\s*,\s*", ", ", s)
-    s = re.sub(r"\s+", " ", s).strip(" ,-")
-    return s
 
 
-def normalize_street_address(value, locality=""):
-    s = clean(value)
-    loc = normalize_locality_for_excel(locality)
-    if not s:
-        return ""
+def _group_word_lines(words, tol=2.2):
+    """Raggruppa le parole PDF che appartengono alla stessa riga visiva."""
+    rows=[]
+    for w in sorted(words,key=lambda x:((x[1]+x[3])/2,x[0])):
+        yc=(w[1]+w[3])/2
+        if not rows or abs(yc-rows[-1][0])>tol:
+            rows.append([yc,[w]])
+        else:
+            rows[-1][1].append(w)
+    return rows
 
-    replacements = [
-        (r"^\s*P\.?\s*ZA\.?\s+", "PIAZZA "),
-        (r"^\s*P\.?\s*ZZA\.?\s+", "PIAZZA "),
-        (r"^\s*P\.?\s*LE\.?\s+", "PIAZZALE "),
-        (r"^\s*V\.?\s*LE\.?\s+", "VIALE "),
-        (r"^\s*C\.?\s*SO\.?\s+", "CORSO "),
-        (r"^\s*L\.?\s*GO\.?\s+", "LARGO "),
+
+def _team_base_key(name):
+    """Chiave squadra senza le sole forme societarie finali (ASD, SSD, SRL...)."""
+    s=clean(name)
+    patterns=[
+        r'S\.?S\.?D\.?\s*A\.?\s*R\.?\s*L\.?$', r'SSD\s*A\s*R\s*L$',
+        r'S\.?S\.?D\.?$', r'SSD(?:ARL|RL)?$', r'A\.?S\.?D\.?$', r'ASD$',
+        r'S\.?R\.?L\.?$', r'SRL$', r'A\.?\s*R\.?\s*L\.?$', r'ARL$',
+        r'C\.?V\.?$', r'F\.?B\.?C\.?$', r'POL\.?D\.?$', r'POL\.?$'
     ]
-    for pattern, replacement in replacements:
-        s = re.sub(pattern, replacement, s)
-
-    s = re.sub(r"\bANG\.\s*", "ANG. ", s)
-    s = re.sub(r"\bLOC\.\s*", "LOC. ", s)
-    s = re.sub(r"\bFRAZ\.\s*", "FRAZ. ", s)
-
-    # ROMA11 -> ROMA 11
-    s = re.sub(r"([A-Z])(?=\d{1,4}(?:/[A-Z0-9]+)?\b)", r"\1 ", s)
-
-    # Rimuove la località se accidentalmente già in fondo all'indirizzo.
-    if loc:
-        s = re.sub(rf"\s*,?\s*{re.escape(loc)}\s*$", "", s, flags=re.I).strip()
-
-    # N.11 / N°11 / N 11 / NUM.11 -> 11
-    s = re.sub(
-        r"\s+(?:N\.?|N°|NR\.?|NUM\.?)\s*(\d+[A-Z]?(?:[/\-]\d+[A-Z]?)?(?:/[A-Z])?)\b",
-        r" \1",
-        s,
-    )
-
-    s = re.sub(r"\s*,\s*", ", ", s)
-    s = re.sub(r"\s+", " ", s).strip(" ,")
-    s = re.sub(r"\bS\.?\s*N\.?\s*C\.?\b", "SNC", s)
-
-    # Civico finale: 11, 38/A, 9/11, 23/25, 14 A, 10/B.
-    m = re.match(
-        r"^(.*?)(?:,\s*|\s+)(\d+(?:[/\-]\d+)?(?:/[A-Z])?|\d+\s+[A-Z])"
-        r"(\s*(?:\([^)]*\)|\"[^\"]*\")\s*)?$",
-        s,
-    )
-    if m:
-        street = m.group(1).strip(" ,")
-        civic = re.sub(r"\s+", "", m.group(2).strip())
-        suffix = (m.group(3) or "").strip()
-        if street:
-            s = f"{street}, {civic}"
-            if suffix:
-                s += f" {suffix}"
-
-    s = re.sub(r",\s*(\d+(?:[/\-]\d+)?(?:/[A-Z])?)\b", r", \1", s)
-    s = re.sub(r",\s*SNC\b", " SNC", s)
-    return s.strip(" ,-")
+    changed=True
+    while changed:
+        changed=False
+        for pat in patterns:
+            ns=re.sub(r'\s*\b'+pat,'',s).strip(' .-')
+            if ns!=s:
+                s=ns; changed=True
+    return re.sub(r'[^A-Z0-9]+','',s)
 
 
-def indirizzo_excel(match):
-    loc = normalize_locality_for_excel(match.locality)
-    addr = normalize_street_address(match.address, loc)
-    if addr and loc:
-        return f"{addr} - {loc}"
-    return addr or loc
+def _squad_suffix_key(name):
+    """Restituisce SQB/SQC/... se presente, altrimenti stringa vuota."""
+    c = clean(name)
+    m = re.search(r'\bSQ\.?\s*([A-Z])\b', c)
+    return f"SQ{m.group(1)}" if m else ''
 
 
-# ============================================================
-# TABELLA SOCIETA' / CAMPI
-# ============================================================
+def _leading_acronym(name):
+    """
+    Riconosce sigle iniziali come:
+      F. O. R. sq.B
+      F.O.R. SQ.B
+      A.C. ...
+    Restituisce la sigla senza punti, es. FOR.
+    """
+    c = clean(name)
+
+    # Variante con punti: F. O. R. / F.O.R.
+    letters = re.findall(r'(?<![A-Z])([A-Z])\.', c)
+    if len(letters) >= 2:
+        # Considera solo la sequenza di sigle iniziale.
+        prefix = re.match(r'^\s*((?:[A-Z]\.\s*){2,8})', c)
+        if prefix:
+            p_letters = re.findall(r'([A-Z])\.?', prefix.group(1))
+            if len(p_letters) >= 2:
+                return ''.join(p_letters)
+
+    return ''
+
+
+def _candidate_initials(name):
+    """
+    Genera le iniziali significative del nome completo squadra.
+    Esempio:
+      FALOPPIESE OLGIATE RO. sq.B -> FOR
+    """
+    c = clean(name)
+    # Togli la parte squadra B/C... e le forme societarie finali.
+    c = re.sub(r'\bSQ\.?\s*[A-Z]\b.*$', '', c).strip()
+    c = re.sub(
+        r'\b(?:A\.?S\.?D\.?|S\.?S\.?D\.?|S\.?R\.?L\.?|A\.?R\.?L\.?|'
+        r'F\.?B\.?C\.?|POL\.?D\.?|POL\.?)\b.*$',
+        '',
+        c
+    ).strip()
+
+    tokens = re.findall(r'[A-Z0-9]+', c)
+    if not tokens:
+        return ''
+
+    # Prefissi societari molto comuni che non fanno parte della sigla "parlante".
+    # Non vengono sempre eliminati: produciamo sia la forma completa sia quella
+    # senza prefisso e scegliamo poi nel confronto.
+    return ''.join(tok[0] for tok in tokens if tok)
+
+
+def _acronym_candidate_score(query_name, candidate_name):
+    """
+    Match generico sigla -> nome esteso.
+    Non contiene nomi squadra hardcoded.
+    """
+    acr = _leading_acronym(query_name)
+    if len(acr) < 2:
+        return 0.0
+
+    cand = _candidate_initials(candidate_name)
+    if not cand:
+        return 0.0
+
+    # La sigla deve combaciare esattamente con le iniziali o esserne
+    # una parte iniziale molto credibile.
+    if cand == acr:
+        score = 1.0
+    elif len(acr) >= 3 and cand.startswith(acr):
+        score = 0.94
+    else:
+        return 0.0
+
+    # Se il calendario specifica SQ.B / SQ.C ecc., deve coincidere.
+    q_sq = _squad_suffix_key(query_name)
+    c_sq = _squad_suffix_key(candidate_name)
+    if q_sq:
+        if c_sq != q_sq:
+            return 0.0
+        score += 0.03
+
+    return min(score, 1.0)
+
+
+def smart_canonical_team(name, teams):
+    """Associa il nome abbreviato del calendario alla riga corretta della tabella campi."""
+    c = clean(name)
+
+    # 1) Match esatto normalizzato.
+    q = _team_base_key(name)
+    exact = [t for t in teams if _team_base_key(t) == q]
+    if len(exact) == 1:
+        return exact[0]
+
+    # 2) Nei calendari CRL "AC." / "ACC." è spesso abbreviazione
+    #    di ACADEMY / ACCADEMIA.
+    ab = re.match(r'^(?:ACC?\.)\s*(.+)$', c)
+    if ab:
+        rem = _team_base_key(ab.group(1))
+        candidates = []
+        for t in teams:
+            mt = re.match(r'^(?:ACADEMY|ACCADEMIA)\s+(.+)$', clean(t))
+            if mt:
+                sc = SequenceMatcher(
+                    None,
+                    rem,
+                    _team_base_key(mt.group(1))
+                ).ratio()
+                candidates.append((sc, t))
+        if candidates:
+            sc, t = max(candidates)
+            if sc >= .72:
+                return t
+
+    # 3) Sigle iniziali generiche:
+    #    F. O. R. sq.B -> FALOPPIESE OLGIATE RO. sq.B
+    acronym_matches = []
+    for t in teams:
+        sc = _acronym_candidate_score(name, t)
+        if sc > 0:
+            acronym_matches.append((sc, t))
+
+    if acronym_matches:
+        acronym_matches.sort(reverse=True)
+        best_sc, best_team = acronym_matches[0]
+
+        # Accetta solo se non c'è ambiguità con un secondo candidato equivalente.
+        if len(acronym_matches) == 1:
+            return best_team
+        second_sc = acronym_matches[1][0]
+        if best_sc - second_sc >= .05:
+            return best_team
+
+    # 4) Fuzzy fallback già usato nelle versioni precedenti.
+    best = None
+    best_score = 0
+    for t in teams:
+        k = _team_base_key(t)
+        sc = SequenceMatcher(None, q, k).ratio()
+
+        if len(q) >= 5 and (q in k or k in q):
+            extra = abs(len(q) - len(k))
+            sc = max(sc, .93 - min(.20, extra * .01))
+
+        # Se entrambe hanno una squadra B/C dichiarata ma diversa,
+        # non consentire un fuzzy match scorretto.
+        q_sq = _squad_suffix_key(name)
+        t_sq = _squad_suffix_key(t)
+        if q_sq and t_sq and q_sq != t_sq:
+            sc = 0
+
+        if sc > best_score:
+            best, best_score = t, sc
+
+    return best if best_score >= .66 else None
+
 
 def parse_modern_field_table_grid(page):
-    """Legge la griglia reale PDF anche con pagina ruotata e colonne sparse."""
+    """
+    Parser primario per le tabelle moderne CRL/LND.
+
+    Usa la griglia reale della tabella PDF tramite PyMuPDF invece delle
+    coordinate assolute del testo. Questo rende la lettura indipendente da:
+    - pagina internamente ruotata di 90/180/270 gradi;
+    - intestazione "Campo/Località" oppure "Campo / Località";
+    - larghezze diverse delle colonne.
+
+    Restituisce TeamInfo con Società, Campo/Località, Indirizzo, Orario, Giorno.
+    """
     try:
-        tables = page.find_tables().tables
+        finder = page.find_tables()
+        tables = getattr(finder, 'tables', []) or []
     except Exception:
         return {}
 
@@ -285,56 +709,102 @@ def parse_modern_field_table_grid(page):
             data = table.extract()
         except Exception:
             continue
+
         if not data or len(data) < 2:
             continue
 
         header_idx = None
+        header = None
+
         for ri, row in enumerate(data[:4]):
-            vals = [clean(c or "") for c in row]
-            joined = " | ".join(vals)
-            if "SOCIETA" in joined and "CAMPO" in joined and "INDIRIZZO" in joined:
+            if not row:
+                continue
+            vals = [clean(c or '') for c in row]
+            joined = ' | '.join(vals)
+            if (
+                'SOCIETA' in joined
+                and 'CAMPO' in joined
+                and 'INDIRIZZO' in joined
+            ):
                 header_idx = ri
+                header = vals
                 break
+
         if header_idx is None:
             continue
 
+        def idx_for(kind):
+            for i, value in enumerate(header):
+                v = clean(value)
+                if kind == 'soc' and v.startswith('SOCIETA'):
+                    return i
+                if kind == 'code' and v in {'N.', 'N'}:
+                    return i
+                if kind == 'field' and v.startswith('CAMPO'):
+                    return i
+                if kind == 'addr' and v.startswith('INDIRIZZO'):
+                    return i
+                if kind == 'time' and v.startswith('ORARIO'):
+                    return i
+                if kind == 'day' and v.startswith('GIORNO'):
+                    return i
+            return None
+
+        i_soc = idx_for('soc')
+        i_code = idx_for('code')
+        i_field = idx_for('field')
+        i_addr = idx_for('addr')
+        i_time = idx_for('time')
+        i_day = idx_for('day')
+
+        if None in (i_soc, i_code, i_field, i_addr):
+            continue
+
         teams = {}
+
         for row in data[header_idx + 1:]:
-            vals = [clean(c or "") if c is not None else "" for c in row]
-            nonempty = [(i, v) for i, v in enumerate(vals) if v]
-            if not nonempty:
+            if not row:
                 continue
 
-            # Individua il codice campo numerico: primo intero 1..5 cifre dopo il nome.
-            code_pos = next((i for i, v in nonempty if re.fullmatch(r"\d{1,5}", v)), None)
-            if code_pos is None:
+            def get_cell(idx):
+                if idx is None:
+                    return ''
+                # In alcuni PDF ruotati PyMuPDF inserisce colonne vuote
+                # attorno alle celle: l'intestazione può risultare in i,
+                # mentre il valore della riga è in i-1. Cerchiamo quindi
+                # la cella non vuota più vicina entro una posizione.
+                candidates = []
+                for pos in (idx, idx - 1, idx + 1):
+                    if 0 <= pos < len(row):
+                        value = clean(row[pos] or '')
+                        if value:
+                            candidates.append((abs(pos - idx), pos, value))
+                if not candidates:
+                    return ''
+                candidates.sort(key=lambda z: (z[0], z[1]))
+                return candidates[0][2]
+
+            name = get_cell(i_soc)
+            code = get_cell(i_code)
+            fieldloc = get_cell(i_field)
+            address = get_cell(i_addr)
+            tm = normalize_time(get_cell(i_time))
+            day_raw = get_cell(i_day)
+
+            if not name or not re.fullmatch(r'\d{1,5}', code):
                 continue
 
-            name = clean(" ".join(v for i, v in nonempty if i < code_pos))
-            if not name or name.startswith("SOCIETA") or name.startswith("LA SOCIETA"):
+            if name.startswith('SOCIETA') or name.startswith('LA SOCIETA'):
                 continue
 
-            time_pos = None
-            for i, v in nonempty:
-                if normalize_time(v):
-                    time_pos = i
-            day_pos = next((i for i, v in nonempty if v in {"SABATO", "DOMENICA", "VENERDI", "VENERDÌ"}), None)
-
-            middle = [
-                (i, v) for i, v in nonempty
-                if i > code_pos and (time_pos is None or i < time_pos) and (day_pos is None or i < day_pos)
-            ]
-            if not middle:
-                continue
-
-            fieldloc = middle[0][1]
-            address = middle[1][1] if len(middle) > 1 else ""
-            tm = normalize_time(vals[time_pos]) if time_pos is not None else ""
-            day = vals[day_pos].title() if day_pos is not None else ""
+            # Giorno: conserviamo solo i valori realmente dichiarati.
+            day = ''
+            if day_raw in {'SABATO', 'DOMENICA', 'VENERDI', 'VENERDÌ'}:
+                day = day_raw.title()
 
             teams[name] = TeamInfo(
                 name=name,
-                locality=extract_locality_from_field(fieldloc, name),
+                locality=extract_locality_from_field(fieldloc),
                 address=address,
                 time=tm,
                 field_name=fieldloc,
@@ -347,202 +817,182 @@ def parse_modern_field_table_grid(page):
     return best
 
 
-def _group_word_lines(words, tol=2.5):
-    rows = []
-    for w in sorted(words, key=lambda x: ((x[1] + x[3]) / 2, x[0])):
-        yc = (w[1] + w[3]) / 2
-        if not rows or abs(yc - rows[-1][0]) > tol:
-            rows.append([yc, [w]])
-        else:
-            rows[-1][1].append(w)
-    return rows
+def parse_modern_field_table_words_v2(page):
+    # Prima scelta: griglia reale della tabella PDF.
+    grid_teams = parse_modern_field_table_grid(page)
+    if len(grid_teams) >= 4:
+        return grid_teams
 
+    """
+    Legge le tabelle CRL/LND moderne:
+    Società | N. | Campo / Località | Indirizzo | Orario | Giorno.
 
-def parse_modern_field_table_words_fallback(page):
-    """Fallback a coordinate se find_tables non è disponibile."""
-    words = page.get_text("words") or []
-    soc = [w for w in words if clean(w[4]).startswith("SOCIETA")]
-    if not soc:
+    Nei PDF U18 l'intestazione è centrata nella colonna e non coincide con
+    il bordo reale dei dati. Per questo il parser ricava dinamicamente le
+    colonne usando il codice campo numerico e gli spazi orizzontali.
+    """
+    words = page.get_text('words') or []
+    if not words:
         return {}
-    hdr_y = min(w[1] for w in soc)
-    code_headers = [w for w in words if clean(w[4]) in {"N.", "N"} and abs(w[1] - hdr_y) < 5]
-    if not code_headers:
+
+    soc_headers = [w for w in words if clean(w[4]).startswith('SOCIETA')]
+    if not soc_headers:
         return {}
+
+    hdr_y = min(w[1] for w in soc_headers)
+
+    code_headers = [
+        w for w in words
+        if clean(w[4]) in {'N.', 'N'} and abs(w[1] - hdr_y) < 5
+    ]
+    campo_headers = [
+        w for w in words
+        if clean(w[4]) == 'CAMPO' and abs(w[1] - hdr_y) < 5
+    ]
+    addr_headers = [
+        w for w in words
+        if clean(w[4]).startswith('INDIRIZZO') and abs(w[1] - hdr_y) < 5
+    ]
+    time_headers = [
+        w for w in words
+        if clean(w[4]).startswith('ORARIO') and abs(w[1] - hdr_y) < 5
+    ]
+    day_headers = [
+        w for w in words
+        if clean(w[4]).startswith('GIORNO') and abs(w[1] - hdr_y) < 5
+    ]
+
+    if not (code_headers and campo_headers and addr_headers):
+        return {}
+
     cx = code_headers[0][0]
+    fx = campo_headers[0][0]
+    ax = addr_headers[0][0]
+    tx = time_headers[0][0] if time_headers else page.rect.width
+    dx = day_headers[0][0] if day_headers else page.rect.width
+
+    data_words = [
+        w for w in words
+        if w[1] > hdr_y + 5 and w[1] < page.rect.height * .90
+    ]
 
     teams = {}
-    data_words = [w for w in words if w[1] > hdr_y + 5 and w[1] < page.rect.height * .92]
-    for _, ws in _group_word_lines(data_words):
+
+    for _, ws in _group_word_lines(data_words, 2.5):
         ordered = sorted(ws, key=lambda w: w[0])
-        codes = [w for w in ordered if re.fullmatch(r"\d{1,5}", clean(w[4])) and abs(w[0] - cx) < 80]
-        if not codes:
+
+        code_candidates = [
+            w for w in ordered
+            if re.fullmatch(r'\d{1,5}', clean(w[4]))
+            and abs(w[0] - cx) < 55
+        ]
+        if not code_candidates:
             continue
-        code = min(codes, key=lambda w: abs(w[0] - cx))
-        name = clean(" ".join(w[4] for w in ordered if w[2] <= code[0] - 1))
-        if not name:
+
+        code_word = min(code_candidates, key=lambda w: abs(w[0] - cx))
+
+        name = clean(' '.join(
+            w[4] for w in ordered
+            if w[2] <= code_word[0] - 1
+        ))
+
+        if (
+            not name
+            or name.startswith('SOCIETA')
+            or name.startswith('LA SOCIETA')
+        ):
             continue
-        # Questo fallback è deliberatamente conservativo: se manca la griglia,
-        # almeno consente il riconoscimento del nome squadra.
-        teams[name] = TeamInfo(name=name)
+
+        time_candidates = [
+            w for w in ordered
+            if normalize_time(w[4]) and w[0] > ax
+        ]
+        time_word = None
+        if time_candidates:
+            time_word = min(time_candidates, key=lambda w: abs(w[0] - tx))
+
+        day_candidates = [
+            w for w in ordered
+            if clean(w[4]) in {'SABATO', 'DOMENICA', 'VENERDI', 'VENERDÌ'}
+            and w[0] >= tx
+        ]
+        day_word = None
+        if day_candidates:
+            day_word = min(day_candidates, key=lambda w: abs(w[0] - dx))
+
+        middle = [
+            w for w in ordered
+            if w[0] > code_word[2] + 1
+            and (time_word is None or w[0] < time_word[0] - 1)
+        ]
+        if len(middle) < 2:
+            continue
+
+        split_idx = None
+        best_score = -1
+
+        for k in range(len(middle) - 1):
+            gap = middle[k + 1][0] - middle[k][2]
+            boundary = (middle[k][2] + middle[k + 1][0]) / 2
+            score = gap
+
+            if fx + 35 <= boundary <= ax + 25:
+                score += 20
+
+            if score > best_score:
+                best_score = score
+                split_idx = k
+
+        if split_idx is None:
+            continue
+
+        field_words = middle[:split_idx + 1]
+        addr_words = middle[split_idx + 1:]
+
+        fieldloc = clean(' '.join(w[4] for w in field_words))
+        address = clean(' '.join(w[4] for w in addr_words))
+        tm = normalize_time(time_word[4]) if time_word else ''
+        day = clean(day_word[4]).title() if day_word else ''
+
+        if not fieldloc:
+            continue
+
+        teams[name] = TeamInfo(
+            name=name,
+            locality=extract_locality_from_field(fieldloc),
+            address=address,
+            time=tm,
+            field_name=fieldloc,
+            day=day,
+        )
+
     return teams
 
 
-def parse_team_table(page):
-    teams = parse_modern_field_table_grid(page)
-    if len(teams) >= 4:
-        return teams
-    fallback = parse_modern_field_table_words_fallback(page)
-    return fallback if len(fallback) > len(teams) else teams
-
-
-# ============================================================
-# MATCH NOMI SQUADRA / ABBREVIAZIONI
-# ============================================================
-
-def _team_tokens(name):
-    s, sq = strip_legal_suffix(name)
-    tokens = re.findall(r"[A-Z0-9]+", clean(s))
-    tokens = [re.sub(r"^(\d{3,4})[A-Z]$", r"\1", x) for x in tokens]
-    return tokens, sq
-
-
-def _token_compat(query_token, candidate_token):
-    if query_token == candidate_token:
-        return 1.0
-    if query_token in {"AC", "ACC"} and candidate_token in {"ACADEMY", "ACCADEMIA"}:
-        return .99
-    if query_token == "S" and candidate_token == "SAN":
-        return .97
-    if len(query_token) == 1 and candidate_token.startswith(query_token):
-        return .90
-    if len(query_token) >= 2 and candidate_token.startswith(query_token):
-        return .96
-    return 0.0
-
-
-def _sequence_abbrev_score(query, candidate):
-    qt, qs = _team_tokens(query)
-    ct, cs = _team_tokens(candidate)
-
-    if qs:
-        if qs != cs:
-            return 0.0
-    elif cs:
-        # Evita COMO 1907 -> COMO 1907 SQ.B quando entrambe esistono.
-        return 0.0
-
-    if not qt or not ct:
-        return 0.0
-
-    m, n = len(qt), len(ct)
-    dp = [[-10**9] * (n + 1) for _ in range(m + 1)]
-    dp[0][0] = 0.0
-
-    for i in range(m + 1):
-        for j in range(n + 1):
-            current = dp[i][j]
-            if current < -10**8:
-                continue
-            if j < n:
-                penalty = .15 if ct[j] in {"GS", "FC", "SC", "US", "POL", "SPORT", "SPORTIVA"} else .35
-                dp[i][j + 1] = max(dp[i][j + 1], current - penalty)
-            if i < m and j < n:
-                comp = _token_compat(qt[i], ct[j])
-                if comp:
-                    dp[i + 1][j + 1] = max(dp[i + 1][j + 1], current + comp)
-
-    return max(dp[m]) / max(1, m)
-
-
-def _leading_acronym(name):
-    c = clean(name)
-    prefix = re.match(r"^\s*((?:[A-Z]\.\s*){2,8})", c)
-    if not prefix:
-        return ""
-    return "".join(re.findall(r"([A-Z])\.", prefix.group(1)))
-
-
-def _candidate_initials(name):
-    tokens, _ = _team_tokens(name)
-    return "".join(x[0] for x in tokens if x)
-
-
-def smart_canonical_team(name, teams):
-    c = clean(name)
-    if "RIPOSA" in c or "RIPOSO" in c:
-        return "RIPOSA"
-
-    q_base, q_sq = strip_legal_suffix(name)
-    q_key = re.sub(r"[^A-Z0-9]+", "", clean(q_base))
-
-    exact = []
-    for team in teams:
-        t_base, t_sq = strip_legal_suffix(team)
-        t_key = re.sub(r"[^A-Z0-9]+", "", clean(t_base))
-        if q_key == t_key and q_sq == t_sq:
-            exact.append(team)
-    if len(exact) == 1:
-        return exact[0]
-
-    # F.O.R. -> FALOPPIESE OLGIATE RONAGO; preserva SQ.B se presente.
-    acronym = _leading_acronym(name)
-    if acronym:
-        candidates = []
-        for team in teams:
-            _, t_sq = strip_legal_suffix(team)
-            if q_sq and t_sq != q_sq:
-                continue
-            if not q_sq and t_sq:
-                continue
-            if _candidate_initials(team).startswith(acronym):
-                candidates.append(team)
-        if len(candidates) == 1:
-            return candidates[0]
-
-    scored = []
-    for team in teams:
-        score = _sequence_abbrev_score(name, team)
-        t_base, t_sq = strip_legal_suffix(team)
-        if (q_sq and q_sq == t_sq) or (not q_sq and not t_sq):
-            t_key = re.sub(r"[^A-Z0-9]+", "", clean(t_base))
-            similarity = SequenceMatcher(None, q_key, t_key).ratio()
-            if q_key and t_key and (q_key in t_key or t_key in q_key):
-                similarity = max(similarity, .88)
-            score = max(score, similarity)
-        scored.append((score, team))
-
-    scored.sort(reverse=True)
-    if scored and scored[0][0] >= .62:
-        if len(scored) == 1 or scored[0][0] - scored[1][0] >= .04 or scored[0][0] >= .90:
-            return scored[0][1]
-    return None
-
-
-# ============================================================
-# CALENDARIO GRAFICO MODERNO
-# ============================================================
-
 def detect_modern_round_headers(page):
-    words = page.get_text("words") or []
-    headers = []
+    """Trova GIORNATA 1..N tramite posizione delle parole nel PDF."""
+    words=page.get_text('words') or []
+    headers=[]
     for w in words:
-        if clean(w[4]) != "GIORNATA":
+        if clean(w[4])!='GIORNATA':
             continue
-        yc = (w[1] + w[3]) / 2
-        candidates = [
-            q for q in words
-            if re.fullmatch(r"\d{1,2}", clean(q[4]))
-            and abs(((q[1] + q[3]) / 2) - yc) < 4
-            and q[0] >= w[2] - 3
-            and q[0] - w[2] < 35
-        ]
+        yc=(w[1]+w[3])/2
+        candidates=[]
+        for q in words:
+            if not re.fullmatch(r'\d{1,2}',clean(q[4])):
+                continue
+            qy=(q[1]+q[3])/2
+            if abs(qy-yc)<3 and q[0]>=w[2]-3 and q[0]-w[2]<30:
+                candidates.append(q)
         if candidates:
-            q = min(candidates, key=lambda z: z[0])
-            headers.append({"rn": int(q[4]), "x": w[0], "y": w[1]})
-    return list({h["rn"]: h for h in headers}.values())
+            q=min(candidates,key=lambda z:z[0])
+            headers.append({'rn':int(q[4]),'x':w[0],'y':w[1]})
+    # elimina eventuali duplicati mantenendo una sola intestazione per numero
+    return list({h['rn']:h for h in headers}.values())
 
 
 def _cluster_items(items, value_func, tol=6):
+    """Raggruppa elementi con coordinate vicine."""
     clusters = []
     for item in sorted(items, key=value_func):
         value = value_func(item)
@@ -550,91 +1000,138 @@ def _cluster_items(items, value_func, tol=6):
             clusters.append([value, [item]])
         else:
             clusters[-1][1].append(item)
-            clusters[-1][0] = sum(value_func(x) for x in clusters[-1][1]) / len(clusters[-1][1])
+            clusters[-1][0] = sum(
+                value_func(x) for x in clusters[-1][1]
+            ) / len(clusters[-1][1])
     return clusters
 
 
 def parse_modern_layout_calendar(page, teams):
-    words = page.get_text("words") or []
+    """
+    Parser layout CRL/LND 2026/27.
+
+    Ogni giornata viene letta come una colonna indipendente. Questo gestisce:
+    - righe verticalmente sfalsate tra una giornata e l'altra;
+    - nomi squadra che vanno a capo;
+    - gironi con numero dispari di squadre e voce RIPOSA.
+    """
+    words = page.get_text('words') or []
     headers = detect_modern_round_headers(page)
+
     if len(headers) < 3:
-        return [], []
+        return []
 
     header_rows = []
-    for h in sorted(headers, key=lambda z: (z["y"], z["x"])):
-        if not header_rows or abs(h["y"] - header_rows[-1][0]) > 10:
-            header_rows.append([h["y"], [h]])
+    for h in sorted(headers, key=lambda z: (z['y'], z['x'])):
+        if not header_rows or abs(h['y'] - header_rows[-1][0]) > 8:
+            header_rows.append([h['y'], [h]])
         else:
             header_rows[-1][1].append(h)
 
     matches = []
-    diagnostics = []
 
     for ri, (hy, group) in enumerate(header_rows):
-        group = sorted(group, key=lambda z: z["x"])
+        group = sorted(group, key=lambda z: z['x'])
         slots = len(group)
-        next_hy = header_rows[ri + 1][0] if ri + 1 < len(header_rows) else page.rect.height * .90
-        band = [w for w in words if w[1] >= hy - 3 and w[1] < next_hy - 4]
 
-        all_separators = [
-            w for w in band
-            if clean(w[4]) in {"-", "–", "—"} and w[1] > hy + 15
+        next_hy = (
+            header_rows[ri + 1][0]
+            if ri + 1 < len(header_rows)
+            else page.rect.height * .86
+        )
+
+        band = [
+            w for w in words
+            if w[1] >= hy - 2 and w[1] < next_hy - 4
         ]
-        x_clusters = _cluster_items(all_separators, lambda w: (w[0] + w[2]) / 2, 8)
 
-        # Collega ogni intestazione GIORNATA al gruppo di trattini più vicino.
-        chosen = []
-        used = set()
-        for h in group:
-            candidates = [
-                (abs(c[0] - (h["x"] + 25)), idx, c)
-                for idx, c in enumerate(x_clusters)
-                if idx not in used and len(c[1]) >= 2
-            ]
-            if candidates:
-                _, idx, c = min(candidates)
-                used.add(idx)
-                chosen.append(c)
-
-        if len(chosen) != slots:
-            chosen = sorted(
-                sorted(x_clusters, key=lambda c: len(c[1]), reverse=True)[:slots],
-                key=lambda c: c[0],
-            )
-        else:
-            chosen = sorted(chosen, key=lambda c: c[0])
-
-        if len(chosen) != slots:
-            diagnostics.append(("xcluster", ri, slots))
+        all_seps = [
+            w for w in band
+            if clean(w[4]) in {'-', '–', '—'}
+            and w[1] > hy + 20
+        ]
+        if not all_seps:
             continue
 
-        centers = [c[0] for c in chosen]
+        x_clusters = _cluster_items(
+            all_seps,
+            lambda w: (w[0] + w[2]) / 2,
+            tol=8
+        )
+
+        x_clusters = sorted(
+            x_clusters,
+            key=lambda c: len(c[1]),
+            reverse=True
+        )[:slots]
+        x_clusters = sorted(x_clusters, key=lambda c: c[0])
+
+        if len(x_clusters) != slots:
+            continue
+
+        centers = [c[0] for c in x_clusters]
+
         if len(centers) > 1:
-            bounds = [max(0, centers[0] - (centers[1] - centers[0]) / 2)]
-            bounds += [(a + b) / 2 for a, b in zip(centers, centers[1:])]
-            bounds += [min(page.rect.width, centers[-1] + (centers[-1] - centers[-2]) / 2)]
+            bounds = [
+                max(0, centers[0] - (centers[1] - centers[0]) / 2)
+            ]
+            bounds += [
+                (a + b) / 2
+                for a, b in zip(centers, centers[1:])
+            ]
+            bounds += [
+                min(
+                    page.rect.width,
+                    centers[-1] + (centers[-1] - centers[-2]) / 2
+                )
+            ]
         else:
             bounds = [0, page.rect.width]
 
         for j, h in enumerate(group):
             x0, x1 = bounds[j], bounds[j + 1]
-            sep_words = sorted(chosen[j][1], key=lambda w: (w[1] + w[3]) / 2)
-            y_clusters = _cluster_items(sep_words, lambda w: (w[1] + w[3]) / 2, 2.5)
+
+            sep_words = sorted(
+                x_clusters[j][1],
+                key=lambda w: (w[1] + w[3]) / 2
+            )
+
+            y_clusters = _cluster_items(
+                sep_words,
+                lambda w: (w[1] + w[3]) / 2,
+                tol=2.5
+            )
             sep_words = [
-                min(cluster[1], key=lambda w: abs(((w[0] + w[2]) / 2) - centers[j]))
+                min(
+                    cluster[1],
+                    key=lambda w: abs(
+                        ((w[0] + w[2]) / 2) - centers[j]
+                    )
+                )
                 for cluster in y_clusters
             ]
+
             if not sep_words:
                 continue
 
             ys = [(w[1] + w[3]) / 2 for w in sep_words]
-            gaps = [b - a for a, b in zip(ys, ys[1:]) if 4 < b - a < 30]
-            game_gap = statistics.median(gaps) if gaps else 10
+            gaps = [
+                b - a for a, b in zip(ys, ys[1:])
+                if 4 < b - a < 20
+            ]
+            game_gap = statistics.median(gaps) if gaps else 8.8
+
             y_bounds = [ys[0] - game_gap / 2]
-            y_bounds += [(a + b) / 2 for a, b in zip(ys, ys[1:])]
+            y_bounds += [
+                (a + b) / 2
+                for a, b in zip(ys, ys[1:])
+            ]
             y_bounds += [ys[-1] + game_gap / 2]
 
-            slot_words = [w for w in band if x0 <= ((w[0] + w[2]) / 2) < x1]
+            slot_words = [
+                w for w in band
+                if x0 <= ((w[0] + w[2]) / 2) < x1
+            ]
 
             dates = []
             for w in slot_words:
@@ -644,472 +1141,951 @@ def parse_modern_layout_calendar(page, teams):
                 if dt and dt not in dates:
                     dates.append(dt)
 
+            if not dates:
+                continue
+
+            andata = dates[0]
+            ritorno = dates[1] if len(dates) > 1 else ''
+
             for k, sep in enumerate(sep_words):
                 sep_x = (sep[0] + sep[2]) / 2
+                y0, y1 = y_bounds[k], y_bounds[k + 1]
+
                 row_words = [
                     w for w in slot_words
-                    if y_bounds[k] <= ((w[1] + w[3]) / 2) < y_bounds[k + 1]
-                    and clean(w[4]) not in {"-", "–", "—"}
+                    if y0 <= ((w[1] + w[3]) / 2) < y1
+                    and clean(w[4]) not in {'-', '–', '—'}
                 ]
-                left = [w for w in row_words if ((w[0] + w[2]) / 2) < sep_x - 1]
-                right = [w for w in row_words if ((w[0] + w[2]) / 2) > sep_x + 1]
 
-                home_raw = clean(" ".join(w[4] for w in sorted(left, key=lambda z: (z[1], z[0]))))
-                away_raw = clean(" ".join(w[4] for w in sorted(right, key=lambda z: (z[1], z[0]))))
+                left = [
+                    w for w in row_words
+                    if ((w[0] + w[2]) / 2) < sep_x - 1
+                ]
+                right = [
+                    w for w in row_words
+                    if ((w[0] + w[2]) / 2) > sep_x + 1
+                ]
+
+                home_raw = clean(' '.join(
+                    w[4] for w in sorted(left, key=lambda w: (w[1], w[0]))
+                ))
+                away_raw = clean(' '.join(
+                    w[4] for w in sorted(right, key=lambda w: (w[1], w[0]))
+                ))
+
                 if not home_raw or not away_raw:
+                    continue
+
+                # RIPOSA non è una partita.
+                if 'RIPOSA' in home_raw or 'RIPOSA' in away_raw:
                     continue
 
                 home = smart_canonical_team(home_raw, teams)
                 away = smart_canonical_team(away_raw, teams)
 
-                if home == "RIPOSA" or away == "RIPOSA":
-                    continue
                 if not home or not away or home == away:
-                    diagnostics.append(("unmapped", h["rn"], home_raw, away_raw, home, away))
-                    continue
-                if not dates:
-                    diagnostics.append(("nodate", h["rn"], home_raw, away_raw))
                     continue
 
-                info_home = teams.get(home, TeamInfo(home))
+                ti = teams.get(home, TeamInfo(home))
                 matches.append(Match(
-                    date=dates[0], home=home, away=away,
-                    time=info_home.time, locality=info_home.locality, address=info_home.address,
-                    round_no=str(h["rn"]),
+                    andata,
+                    home,
+                    away,
+                    ti.time,
+                    ti.locality,
+                    ti.address,
+                    str(h['rn'])
                 ))
 
-                if len(dates) >= 2:
-                    info_return = teams.get(away, TeamInfo(away))
+                if ritorno:
+                    ti2 = teams.get(away, TeamInfo(away))
                     matches.append(Match(
-                        date=dates[1], home=away, away=home,
-                        time=info_return.time, locality=info_return.locality, address=info_return.address,
-                        round_no=str(h["rn"]),
+                        ritorno,
+                        away,
+                        home,
+                        ti2.time,
+                        ti2.locality,
+                        ti2.address,
+                        str(h['rn'])
                     ))
 
-    unique = {}
-    for m in matches:
-        unique[(m.date, m.home, m.away, m.round_no)] = m
-    return list(unique.values()), diagnostics
+    return matches
 
+def parse_modern_native_calendar(page, teams):
+    """
+    Legge i calendari grafici moderni direttamente dal testo nativo del PDF.
 
-# ============================================================
-# PROGRAMMA GARE / COPPA ITALIA
-# ============================================================
+    In molti PDF CRL/LND l'ordine interno è:
+        CASA
+        -
+        OSPITE
+        ... (tutte le gare della giornata)
+        GIORNATA N
+        A. gg/mm/aaaa
+        R. gg/mm/aaaa
 
-def parse_programma_gare_pdf(doc):
-    sections = []
-    groups = {}
-    competition = "COPPA ITALIA ECCELLENZA"
+    È molto più stabile dell'OCR su Streamlit Cloud e impedisce che una
+    singola gara venga persa per differenze di versione di Tesseract.
+    """
+    raw = page.get_text('text') or ''
+    lines = [clean(x) for x in raw.splitlines() if clean(x)]
+    if not lines:
+        return []
 
-    for page in doc:
-        try:
-            tables = page.find_tables().tables
-        except Exception:
-            tables = []
-        for table in tables:
-            data = table.extract()
-            current_group = None
-            for row in data:
-                vals = [clean(x or "") if x is not None else "" for x in row]
-                if not any(vals):
+    # Occorrenze delle intestazioni GIORNATA nel testo nativo.
+    headers = []
+    for i, ln in enumerate(lines):
+        m = re.search(r'GIORNATA\s*(\d+)|(?:^|\s)(\d+)\s*GIORNATA', ln, re.I)
+        if m:
+            rn = m.group(1) or m.group(2)
+            headers.append((i, rn))
+    if not headers:
+        return []
+
+    out = []
+    segment_start = 0
+    parsed_rounds = 0
+
+    for hidx, (i, round_no) in enumerate(headers):
+        # Le gare della giornata precedono l'intestazione GIORNATA.
+        segment = lines[segment_start:i]
+        pairs = []
+
+        # Formato più comune: CASA / '-' / OSPITE.
+        for j in range(1, len(segment)-1):
+            sep = segment[j].strip()
+            if sep not in {'-', '–', '—', '='}:
+                continue
+            home_raw = segment[j-1]
+            away_raw = segment[j+1]
+            if not home_raw or not away_raw:
+                continue
+            home = canonical_team(home_raw, teams, .62)
+            away = canonical_team(away_raw, teams, .62)
+            if home and away and home != away:
+                pair = (home, away)
+                if pair not in pairs:
+                    pairs.append(pair)
+
+        # Fallback: alcune estrazioni native tengono "CASA - OSPITE" su una riga.
+        if not pairs:
+            for ln in segment:
+                m = re.match(r'(.+?)\s+[-–—]\s+(.+)$', ln)
+                if not m:
                     continue
-                if vals[0].startswith("CAMPIONATO "):
-                    competition = re.sub(r"^CAMPIONATO\s+[A-Z]{1,3}\s+", "", vals[0]).strip() or competition
-                    continue
-                gm = re.match(r"GIRONE\s+(\d+)", vals[0])
-                if gm:
-                    current_group = gm.group(1)
-                    groups.setdefault(current_group, [])
-                    continue
-                if current_group and len(vals) >= 8:
-                    dt = normalize_numeric_date(vals[3])
-                    tm = normalize_time(vals[4])
-                    if dt and tm and vals[0] and vals[1]:
-                        groups[current_group].append(Match(
-                            date=dt,
-                            home=vals[0],
-                            away=vals[1],
-                            time=tm,
-                            locality=vals[6],
-                            address=vals[7],
-                            round_no=vals[5],
-                        ))
+                home = canonical_team(m.group(1), teams, .62)
+                away = canonical_team(m.group(2), teams, .62)
+                if home and away and home != away:
+                    pair = (home, away)
+                    if pair not in pairs:
+                        pairs.append(pair)
 
-    for group, matches in sorted(groups.items(), key=lambda x: int(x[0])):
-        names = sorted({m.home for m in matches} | {m.away for m in matches})
-        teams = {name: TeamInfo(name=name) for name in names}
+        # Date A./R. sono immediatamente dopo l'intestazione.
+        da = ''
+        dr = ''
+        scan_end = headers[hidx+1][0] if hidx+1 < len(headers) else min(len(lines), i+8)
+        # Non serve arrivare alla giornata successiva: bastano poche righe.
+        scan_end = min(scan_end, i+8)
+        for ln in lines[i+1:scan_end]:
+            ma = re.search(r'\bA[.,]?\s*(\d{1,2}[./-]\d{1,2}[./-]20\d{2})', ln, re.I)
+            mr = re.search(r'\bR[.,]?\s*(\d{1,2}[./-]\d{1,2}[./-]20\d{2})', ln, re.I)
+            if ma and not da:
+                da = normalize_numeric_date(ma.group(1))
+            if mr and not dr:
+                dr = normalize_numeric_date(mr.group(1))
+
+        if pairs and da:
+            parsed_rounds += 1
+            for home, away in pairs:
+                ti = teams.get(home, TeamInfo(home))
+                out.append(Match(da, home, away, ti.time, ti.locality, ti.address, str(round_no)))
+                if dr:
+                    ti2 = teams.get(away, TeamInfo(away))
+                    out.append(Match(dr, away, home, ti2.time, ti2.locality, ti2.address, str(round_no)))
+
+        # Il segmento successivo parte dopo le righe A./R.
+        next_start = i + 1
+        while next_start < len(lines) and next_start < i + 8:
+            ln = lines[next_start]
+            if re.search(r'\b[AR][.,]?\s*\d{1,2}[./-]\d{1,2}[./-]20\d{2}', ln, re.I):
+                next_start += 1
+                continue
+            break
+        segment_start = next_start
+
+    # Usa il parser nativo solo se ha letto praticamente tutte le giornate.
+    # Altrimenti si lascia lavorare il fallback OCR già esistente.
+    if parsed_rounds >= max(1, int(len(headers) * .85)):
+        return out
+    return []
+
+def parse_graphic_calendar(page,teams):
+    # Prima prova il testo nativo: è deterministico e non dipende dalla
+    # versione di Tesseract installata su Streamlit Cloud.
+    native = parse_modern_native_calendar(page, teams)
+    if native:
+        return native
+
+    img=render_page(page,2)
+    boxes=find_white_calendar_boxes(img)
+
+    # --------------------------------------------------------
+    # DATE DELLE GIORNATE
+    # --------------------------------------------------------
+    # Nei PDF grafici moderni il testo delle squadre può avere una
+    # mappa-font problematica, mentre le date A./R. sono spesso
+    # perfettamente estraibili dal testo nativo del PDF.
+    # Usiamo quindi PRIMA il testo nativo e OCR solo come fallback.
+    # Questo evita, per esempio, di perdere il ritorno dell'ultima
+    # giornata quando Tesseract non riconosce una singola data.
+    direct_text=page.get_text('text') or ''
+
+    a_direct=re.findall(
+        r'\bA[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',
+        direct_text,
+        re.I
+    )
+    r_direct=re.findall(
+        r'\bR[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',
+        direct_text,
+        re.I
+    )
+
+    a_dates=[normalize_numeric_date(x) for x in a_direct]
+    r_dates=[normalize_numeric_date(x) for x in r_direct]
+    a_dates=[x for x in a_dates if x]
+    r_dates=[x for x in r_dates if x]
+
+    # Se il testo nativo non restituisce abbastanza date, completa
+    # la lettura tramite OCR dell'intera pagina.
+    if len(a_dates)<len(boxes) or len(r_dates)<len(boxes):
+        whole=ocr_img(img,6)
+        a_ocr=[normalize_numeric_date(x) for x in re.findall(
+            r'\bA[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',
+            whole,
+            re.I
+        )]
+        r_ocr=[normalize_numeric_date(x) for x in re.findall(
+            r'\bR[.,]?\s*(\d{1,2}/\d{1,2}/20\d{2})',
+            whole,
+            re.I
+        )]
+        a_ocr=[x for x in a_ocr if x]
+        r_ocr=[x for x in r_ocr if x]
+
+        # Preferisce la fonte che ha riconosciuto più giornate.
+        if len(a_ocr)>len(a_dates):
+            a_dates=a_ocr
+        if len(r_ocr)>len(r_dates):
+            r_dates=r_ocr
+
+    names=list(teams)
+    out=[]
+    for idx,box in enumerate(boxes):
+        x,y,w,h=box
+        txt=ocr_img(img[y:y+h,x:x+w],6)
+        lines=[clean(z) for z in txt.split(' | ') if clean(z)] if ' | ' in txt else [clean(z) for z in re.split(r'[\n\r]+',pytesseract.image_to_string(cv2.resize(cv2.cvtColor(img[y:y+h,x:x+w],cv2.COLOR_BGR2GRAY),None,fx=3,fy=3),config='--psm 6')) if clean(z)]
+        pairs=[]
+        for ln in lines:
+            # identify two best teams in line by fuzzy substring/ratio on left-right separator candidates
+            # separators OCR may be -, +, =, —
+            cand_parts=re.split(r'\s+[-+—=]+\s+',ln,maxsplit=1)
+            if len(cand_parts)==2:
+                hname=canonical_team(cand_parts[0],teams,.62); aname=canonical_team(cand_parts[1],teams,.62)
+                if hname and aname and hname!=aname:pairs.append((hname,aname));continue
+            # fallback: try every pair and compare concatenation
+            best=None;sc=0
+            for hname in names:
+                for aname in names:
+                    if hname==aname:continue
+                    rr=ratio(ln,hname+' '+aname)
+                    if rr>sc:best,sc=(hname,aname),rr
+            if best and sc>.72:pairs.append(best)
+        # dedupe preserve order
+        uniq=[]
+        for p in pairs:
+            if p not in uniq:uniq.append(p)
+        da=a_dates[idx] if idx<len(a_dates) else ''
+        dr=r_dates[idx] if idx<len(r_dates) else ''
+        for home,away in uniq:
+            ti=teams.get(home,TeamInfo(home));out.append(Match(da,home,away,ti.time,ti.locality,ti.address,str(idx+1)))
+            if dr:
+                ti2=teams.get(away,TeamInfo(away));out.append(Match(dr,away,home,ti2.time,ti2.locality,ti2.address,str(idx+1)))
+    return out
+
+# ---------- Programma gare ----------
+def parse_programma_gare_page(text):
+    lines=[clean(x) for x in text.splitlines() if clean(x)]
+    comp='COPPA ITALIA ECCELLENZA'
+    for ln in lines[:8]:
+        if 'CAMPIONATO' in ln:
+            comp=re.sub(r'^CAMPIONATO\s+[A-Z]{1,3}\s*','',ln).strip() or comp
+    sections=[]; i=0
+    while i<len(lines):
+        gm=re.match(r'GIRONE\s+(\d+|[A-Z])$',lines[i])
+        if not gm:i+=1;continue
+        group=gm.group(1); start=i+1; i+=1
+        while i<len(lines) and not re.match(r'GIRONE\s+(\d+|[A-Z])$',lines[i]):i+=1
+        seg=lines[start:i]
+        # remove headers
+        seg=[x for x in seg if x not in ['DATA','ORA','PROGRAMMA GARE']]
+        matches=[]; last=0
+        for di,s in enumerate(seg):
+            if re.fullmatch(r'\d{1,2}/\d{1,2}/20\d{2}',s):
+                if di>=3 and di+2<len(seg):
+                    home,away,venue=seg[di-3],seg[di-2],seg[di-1]
+                    mt=re.match(r'([0-2]?\d[:.]\d{2})\s+\w+\s+(.+)$',seg[di+1])
+                    if mt:
+                        tm=normalize_time(mt.group(1)); loc=clean(mt.group(2)); addr=seg[di+2]
+                        matches.append(Match(normalize_numeric_date(s),home,away,tm,loc,addr,''))
         if matches:
-            sections.append(Section(competition, group, teams, matches, "programma_gare_grid"))
+            teams={}
+            for m in matches:
+                teams.setdefault(m.home,TeamInfo(m.home,m.locality,m.address,m.time, ''))
+                teams.setdefault(m.away,TeamInfo(m.away))
+            sections.append(Section(comp,group,teams,matches,'programma_gare'))
     return sections
 
-
-# ============================================================
-# INTESTAZIONE CATEGORIA / GIRONE
-# ============================================================
-
-def parse_competition_group(text):
-    lines = [clean(x) for x in (text or "").splitlines() if clean(x)]
-    group = ""
-    for line in lines:
-        m = re.search(r"\bGIRONE\s*:?[ ]*([A-Z0-9]+)\b", line)
-        if m:
-            group = m.group(1)
-            break
-
-    competition = ""
-    skip = {"FASE AUTUNNALE", "FASE PRIMAVERILE", f"GIRONE {group}" if group else ""}
-    for line in lines[:12]:
-        if line in skip or line.startswith("STAGIONE") or re.fullmatch(r"20\d{2}/20\d{2}", line):
-            continue
-        if line.startswith("SOCIETA") or line.startswith("COMITATO") or line.startswith("LOMBARDIA"):
-            continue
-        if "GIRONE" in line and len(line) < 30:
-            continue
-        if len(line) >= 4:
-            competition = line
-            break
-    return competition or "CALENDARIO", group
-
-
-# ============================================================
-# PARSER PDF PRINCIPALE
-# ============================================================
-
+# ---------- document-level ----------
 def parse_pdf(path):
-    doc = fitz.open(path)
-    all_text = "\n".join(page.get_text("text") for page in doc)
+    doc=fitz.open(path)
+    texts=[p.get_text('text') for p in doc]
+    alltext='\n'.join(texts)
 
-    # Programma Gare è una struttura diversa dai calendari A/R.
-    if "PROGRAMMA GARE" in clean(all_text) and "COPPA ITALIA" in clean(all_text):
-        sections = parse_programma_gare_pdf(doc)
-        if sections:
-            return sections
+    # Programma Gare / Coppe: struttura tabellare diversa dal calendario A/R.
+    if 'PROGRAMMA GARE' in alltext.upper() and re.search(r'GIRONE\s+\d+',alltext,re.I):
+        secs=[]
+        for t in texts:
+            secs.extend(parse_programma_gare_page(t))
+        return secs
 
-    sections = []
-    used = set()
+    sections=[]
+    used=set()
 
-    # Ogni coppia calendario + tabella campi diventa una sezione.
-    for pi in range(len(doc) - 1):
+    # 1) Nuovi calendari grafici CRL/LND: pagina calendario + pagina tabella campi.
+    #    Non cerchiamo la frase "ELENCO CAMPI": nei file U14/U15/U16/U17 non c'è.
+    for pi in range(len(doc)-1):
         if pi in used:
             continue
-        headers = detect_modern_round_headers(doc[pi])
-        if len(headers) < 3:
-            continue
-        teams = parse_team_table(doc[pi + 1])
-        if len(teams) < 4:
-            continue
-        matches, diagnostics = parse_modern_layout_calendar(doc[pi], teams)
-        if not matches:
-            continue
-        competition, group = parse_competition_group(doc[pi + 1].get_text("text"))
-        sections.append(Section(competition, group, teams, matches, "modern_layout_v4"))
-        used.update([pi, pi + 1])
+        headers=detect_modern_round_headers(doc[pi])
+        teams_modern=parse_modern_field_table_words_v2(doc[pi+1])
+        if len(headers)>=3 and len(teams_modern)>=4:
+            comp,group=parse_header_comp_group(texts[pi+1])
+            matches=parse_modern_layout_calendar(doc[pi],teams_modern)
+            if matches:
+                sections.append(Section(comp or 'CALENDARIO',group,teams_modern,matches,'modern_native_layout'))
+                used.update([pi,pi+1])
 
-    return sections
+    # 2) Formati classici / provinciali già supportati.
+    for pi,t in enumerate(texts):
+        if pi in used:
+            continue
+        nxt=texts[pi+1] if pi+1<len(texts) else ''
+        if ('GIORNATA' in t.upper() or 'G I O R N A T A' in t.upper()) and ('E L E N C O' in nxt.upper() and ('CAMPI' in nxt.upper() or 'C A M P I' in nxt.upper())):
+            comp,group=parse_header_comp_group(t+'\n'+nxt)
+            teams=parse_field_table_words(doc[pi+1])
+            if len(teams)<5:
+                teams=parse_field_table_text(nxt)
+            if len(teams)<5:
+                teams=parse_graphic_field_table(doc[pi+1])
+            if 'ANDATA:' in t.upper():
+                matches=parse_classic_segment(t,teams); fmt='classic'
+            elif direct_text_quality(t)>.80:
+                matches=parse_simple_calendar(t,teams,comp,group); fmt='simple_graphic_text'
+            else:
+                matches=parse_graphic_calendar(doc[pi],teams); fmt='graphic_ocr'
+            if matches:
+                sections.append(Section(comp or 'CALENDARIO',group,teams,matches,fmt))
+                used.update([pi,pi+1])
 
+    # 3) Fallback OCR per vecchi PDF grafici con mappa-font corrotta.
+    if not sections and len(doc)>=2:
+        teams=parse_graphic_field_table(doc[1])
+        if teams:
+            ocrhead=ocr_img(render_page(doc[1],2)[:380,:,:],6)
+            comp,group=parse_header_comp_group(ocrhead)
+            first_clean=''
+            for ln in texts[1].splitlines():
+                c=clean(ln)
+                if c and sum(ch.isascii() for ch in c)/max(1,len(c))>.9 and len(c)>=5:
+                    first_clean=c
+                    break
+            if first_clean and 'GIRONE' not in first_clean and len(first_clean)<80:
+                comp=first_clean
+            matches=parse_graphic_calendar(doc[0],teams)
+            if matches:
+                sections.append(Section(comp or 'CALENDARIO',group,teams,matches,'graphic_ocr'))
 
-# ============================================================
-# DOCX - FALLBACK CLASSICO
-# ============================================================
+    return [s for s in sections if s.matches]
 
 def parse_docx(path):
+    from docx import Document
+    d=Document(path)
+    text='\n'.join(p.text for p in d.paragraphs)
+    # split by committee section header, retaining each segment
+    starts=[m.start() for m in re.finditer(r'\*\s*[A-Z0-9 .\-]+\s+GIRONE:\s*[A-Z0-9]+\s*\*',text,re.I)]
+    if not starts:starts=[0]
+    starts.append(len(text));secs=[]
+    for a,b in zip(starts,starts[1:]):
+        seg=text[a:b]
+        comp,group=parse_header_comp_group(seg)
+        teams=parse_field_table_text(seg)
+        matches=parse_classic_segment(seg,teams)
+        if matches:secs.append(Section(comp or 'CALENDARIO',group,teams,matches,'classic_docx'))
+    return secs
+
+
+# ============================================================
+# STREAMLIT APP
+# ============================================================
+
+def normalize_locality_for_excel(value):
+    """Normalizza la località senza alterarne il significato."""
+    s = clean(value)
+    if not s:
+        return ''
+
+    # Spaziatura di abbreviazioni frequenti.
+    s = re.sub(r'\bLOC\.\s*', 'LOC. ', s)
+    s = re.sub(r'\bFRAZ\.\s*', 'FRAZ. ', s)
+    s = re.sub(r'\bQ\.?\s*RE\b', 'Q.RE', s)
+
+    # Punteggiatura/spazi.
+    s = re.sub(r'\s*,\s*', ', ', s)
+    s = re.sub(r'\s+', ' ', s).strip(' ,-')
+    return s
+
+
+def normalize_street_address(value, locality=''):
     """
-    Supporto conservativo per vecchi DOCX LND. Il parser cerca calendario classico
-    ANDATA/RITORNO e l'elenco campi. Se il documento non corrisponde, restituisce [].
+    Normalizza l'indirizzo per l'Excel.
+
+    Esempi:
+      VIA ROMA N. 11 ROMA  -> VIA ROMA, 11
+      VIA ROMA11 ,ROMA     -> VIA ROMA, 11
+      P.ZA GARIBALDI 5     -> PIAZZA GARIBALDI, 5
+      V.LE DELLO SPORT 27  -> VIALE DELLO SPORT, 27
+
+    La località viene aggiunta separatamente da indirizzo_excel().
     """
+    s = clean(value)
+    loc = normalize_locality_for_excel(locality)
+
+    if not s:
+        return ''
+
+    # Uniforma alcune abbreviazioni stradali comuni.
+    replacements = [
+        (r'^\s*P\.?\s*ZA\.?\s+', 'PIAZZA '),
+        (r'^\s*P\.?\s*ZZA\.?\s+', 'PIAZZA '),
+        (r'^\s*P\.?\s*LE\.?\s+', 'PIAZZALE '),
+        (r'^\s*V\.?\s*LE\.?\s+', 'VIALE '),
+        (r'^\s*C\.?\s*SO\.?\s+', 'CORSO '),
+        (r'^\s*L\.?\s*GO\.?\s+', 'LARGO '),
+    ]
+    for pat, rep in replacements:
+        s = re.sub(pat, rep, s)
+
+    # Uniforma indicatori interni.
+    s = re.sub(r'\bANG\.\s*', 'ANG. ', s)
+    s = re.sub(r'\bLOC\.\s*', 'LOC. ', s)
+    s = re.sub(r'\bFRAZ\.\s*', 'FRAZ. ', s)
+
+    # Se numero e parola sono attaccati: ROMA11 -> ROMA 11.
+    # Limitato ai casi in cui le cifre sono in fondo o prima della località.
+    s = re.sub(r'([A-ZÀ-Ý])(\d{1,4}(?:/[A-Z0-9]+)?)\b', r'\1 \2', s)
+
+    # Togli la località se è stata inglobata alla fine dell'indirizzo.
+    # Gestisce "VIA ROMA 11, ROMA" e "VIA ROMA 11 ROMA".
+    if loc:
+        loc_re = re.escape(loc)
+        s = re.sub(rf'\s*,?\s*{loc_re}\s*$', '', s, flags=re.I).strip()
+
+    # Uniforma "N. 11", "N°11", "N 11" prima del civico.
+    s = re.sub(
+        r'\s+(?:N\.?|N°|NR\.?|NUM\.?)\s*(\d+[A-Z]?(?:/[A-Z0-9]+)?)\b',
+        r' \1',
+        s
+    )
+
+    # Virgole e spazi.
+    s = re.sub(r'\s*,\s*', ', ', s)
+    s = re.sub(r'\s+', ' ', s).strip(' ,')
+
+    # SNC/S.N.C. = nessun numero civico: lo conserviamo ma senza virgola.
+    s = re.sub(r'\bS\.?\s*N\.?\s*C\.?\b', 'SNC', s)
+
+    # Cerca il civico finale, eventualmente seguito da una nota tra parentesi
+    # o da una denominazione tra virgolette.
+    # Esempi: "VIA ROMA 11", "VIA ROMA 11/A", "VIA ... 162 (DEROGA)".
+    m = re.match(
+        r'^(.*?)(?:,\s*|\s+)'
+        r'(\d+[A-Z]?(?:[/\-]\d+[A-Z]?)?(?:/[A-Z])?)'
+        r'(\s*(?:\([^)]*\)|"[^"]*")\s*)?$',
+        s
+    )
+
+    if m:
+        street = m.group(1).strip(' ,')
+        civic = m.group(2).strip()
+        suffix = (m.group(3) or '').strip()
+
+        # Evita di interpretare come civico un numero che fa parte
+        # del solo nome della strada se manca un vero nome precedente.
+        if street:
+            s = f"{street}, {civic}"
+            if suffix:
+                s += f" {suffix}"
+
+    # Se esiste già una virgola prima del civico, standardizzala.
+    s = re.sub(
+        r',\s*(\d+[A-Z]?(?:[/\-]\d+[A-Z]?)?(?:/[A-Z])?)\b',
+        r', \1',
+        s
+    )
+
+    # SNC non deve avere una virgola davanti.
+    s = re.sub(r',\s*SNC\b', ' SNC', s)
+
+    return s.strip(' ,-')
+
+
+def indirizzo_excel(match):
+    """
+    Formato finale:
+      VIA / PIAZZA / VIALE ..., CIVICO - CITTÀ
+    oppure, senza civico:
+      VIA / PIAZZA / VIALE ... - CITTÀ
+    """
+    loc = normalize_locality_for_excel(match.locality)
+    addr = normalize_street_address(match.address, loc)
+
+    if addr and loc:
+        return f"{addr} - {loc}"
+    return addr or loc
+
+
+def sort_date_value(s):
     try:
-        from docx import Document
-    except Exception:
-        return []
+        return datetime.strptime(s, '%d/%m/%Y')
+    except:
+        return datetime.max
 
-    document = Document(path)
-    lines = [p.text for p in document.paragraphs if p.text.strip()]
-    text = "\n".join(lines)
-
-    # Ricava categoria/girone.
-    competition, group = parse_competition_group(text)
-
-    # Estrazione minima delle partite: righe ASCII con " - ".
-    raw_matches = []
-    current_a = current_r = ""
-    round_no = ""
-    for line in lines:
-        c = clean(line)
-        ma = re.search(r"ANDATA:\s*(\d{1,2}/\d{1,2}/\d{2,4})", c)
-        mr = re.search(r"RITORNO:\s*(\d{1,2}/\d{1,2}/\d{2,4})", c)
-        mg = re.search(r"\b(\d{1,2})\s+G\s*I\s*O\s*R\s*N\s*A\s*T\s*A\b", c)
-        if ma:
-            current_a = normalize_numeric_date(ma.group(1))
-        if mr:
-            current_r = normalize_numeric_date(mr.group(1))
-        if mg:
-            round_no = mg.group(1)
-
-        # I vecchi DOCX possono avere tre riquadri sulla stessa riga: separa i blocchi '| ... |'.
-        blocks = re.findall(r"\|([^|]+?)\|", line)
-        for block in blocks:
-            b = clean(block)
-            if " - " not in b or "GIORNATA" in b or "ANDATA" in b or "RITORNO" in b:
-                continue
-            parts = [x.strip() for x in re.split(r"\s+-\s+", b, maxsplit=1)]
-            if len(parts) == 2 and parts[0] and parts[1] and "RIPOSA" not in b:
-                if current_a:
-                    raw_matches.append((current_a, parts[0], parts[1], round_no))
-                if current_r:
-                    raw_matches.append((current_r, parts[1], parts[0], round_no))
-
-    if not raw_matches:
-        return []
-
-    names = sorted({h for _, h, _, _ in raw_matches} | {a for _, _, a, _ in raw_matches})
-    teams = {n: TeamInfo(n) for n in names}
-    matches = [Match(d, h, a, round_no=r) for d, h, a, r in raw_matches]
-    return [Section(competition, group, teams, matches, "docx_classic")]
-
-
-# ============================================================
-# DATE E GIORNO SOCIETA'
-# ============================================================
-
-def adjusted_match_date(section, match):
-    """
-    A./R. = data ufficiale della delegazione.
-    - Giorno vuoto: data invariata.
-    - Sabato/Domenica: allinea solo se la data ufficiale cade nel weekend.
-    - Turni infrasettimanali: invariati.
-    """
-    try:
-        dt = datetime.strptime(match.date, "%d/%m/%Y")
-    except Exception:
-        return match.date
-
-    info = section.teams.get(match.home)
-    declared = clean(info.day) if info else ""
-    declared = declared.replace("Ì", "I").replace("Í", "I")
-    if not declared:
-        return dt.strftime("%d/%m/%Y")
-
-    wd = dt.weekday()  # lun=0, sab=5, dom=6
-    if wd not in (5, 6):
-        return dt.strftime("%d/%m/%Y")
-
-    if declared == "SABATO" and wd == 6:
-        dt -= timedelta(days=1)
-    elif declared == "DOMENICA" and wd == 5:
-        dt += timedelta(days=1)
-
-    return dt.strftime("%d/%m/%Y")
-
-
-def adjusted_sort_key(section, match):
-    return (sort_date_value(adjusted_match_date(section, match)), match.time, match.home, match.away)
-
-
-# ============================================================
-# EXCEL
-# ============================================================
 
 def excel_date_value(value):
-    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+    """Converte gg/mm/aaaa in una vera data Excel."""
+    value=clean(value)
+    for fmt in ('%d/%m/%Y','%d/%m/%y'):
         try:
             return datetime.strptime(value, fmt).date()
         except ValueError:
             pass
     return value
 
-
 def excel_time_value(value):
-    value = normalize_time(value)
+    """Converte HH:MM / HH.MM in un vero orario Excel."""
+    value=normalize_time(value)
     if not value:
-        return ""
+        return ''
     try:
-        return datetime.strptime(value, "%H:%M").time()
+        return datetime.strptime(value, '%H:%M').time()
     except ValueError:
         return value
 
 
+def adjusted_match_date(section, match):
+    """
+    Restituisce la data effettiva della gara applicando la regola CRL/LND:
+
+    1) A./R. nel calendario = data ufficiale fissata dalla delegazione.
+    2) Se la colonna Giorno della squadra di casa è vuota:
+       la data A./R. resta invariata.
+    3) Se Giorno = Sabato o Domenica e la data ufficiale è nel weekend:
+       - ufficiale Sabato + Giorno Domenica -> +1 giorno
+       - ufficiale Domenica + Giorno Sabato -> -1 giorno
+       - se il giorno coincide -> nessuna modifica.
+    4) I turni infrasettimanali restano sulla data ufficiale A./R.
+       anche se la società ha un giorno abituale indicato nella tabella.
+    """
+    try:
+        dt = datetime.strptime(match.date, '%d/%m/%Y')
+    except Exception:
+        return match.date
+
+    info = section.teams.get(match.home)
+    declared_day = clean(info.day) if info else ''
+
+    # Nessun giorno dichiarato: prevale integralmente A./R.
+    if not declared_day:
+        return dt.strftime('%d/%m/%Y')
+
+    # Normalizzazione.
+    declared_day = (
+        declared_day
+        .replace('Ì', 'I')
+        .replace('Í', 'I')
+        .replace('È', 'E')
+    )
+
+    # Python: lun=0 ... sab=5, dom=6.
+    wd = dt.weekday()
+
+    # La correzione riguarda esclusivamente il weekend.
+    # Un turno infrasettimanale è una data speciale fissata dalla delegazione.
+    if wd not in (5, 6):
+        return dt.strftime('%d/%m/%Y')
+
+    from datetime import timedelta
+
+    if declared_day == 'SABATO':
+        if wd == 6:          # domenica ufficiale -> sabato precedente
+            dt -= timedelta(days=1)
+
+    elif declared_day == 'DOMENICA':
+        if wd == 5:          # sabato ufficiale -> domenica successiva
+            dt += timedelta(days=1)
+
+    return dt.strftime('%d/%m/%Y')
+
+
+def adjusted_sort_key(section, match):
+    actual_date = adjusted_match_date(section, match)
+    return (
+        sort_date_value(actual_date),
+        match.time,
+        match.home,
+        match.away,
+    )
+
+
+def infer_rest_events(section, selected_team):
+    """
+    Individua i riposi in modo prudente.
+
+    Un RIPOSO viene inferito solo quando:
+    - il girone ha un numero dispari di squadre;
+    - la giornata/data è stata ricostruita correttamente;
+    - in quella giornata sono presenti esattamente N//2 partite;
+    - la squadra selezionata non compare in nessuna di esse.
+
+    In questo modo una partita eventualmente non riconosciuta dal parser
+    NON viene automaticamente trasformata in RIPOSO.
+    """
+    all_teams = sorted(set(
+        [m.home for m in section.matches] +
+        [m.away for m in section.matches]
+    ))
+
+    n_teams = len(all_teams)
+    if n_teams < 3 or n_teams % 2 == 0:
+        return []
+
+    expected_matches_per_slot = n_teams // 2
+
+    # Una "slot" è una singola data di una giornata.
+    # Nei calendari con A./R. la stessa giornata genera due slot:
+    # una per l'andata e una per il ritorno.
+    slots = {}
+    for m in section.matches:
+        if not m.round_no or not m.date:
+            continue
+        key = (str(m.round_no), m.date)
+        slots.setdefault(key, []).append(m)
+
+    rests = []
+
+    for (round_no, official_date), matches in slots.items():
+        # Deduplica eventuali duplicati del parser.
+        unique_pairs = {
+            (m.home, m.away)
+            for m in matches
+            if m.home and m.away
+        }
+
+        # Se non abbiamo ricostruito tutte le partite previste,
+        # non possiamo concludere con sicurezza che sia un riposo.
+        if len(unique_pairs) != expected_matches_per_slot:
+            continue
+
+        present = set()
+        for home, away in unique_pairs:
+            present.add(home)
+            present.add(away)
+
+        if selected_team not in present:
+            rests.append({
+                'date': official_date,
+                'round_no': round_no,
+            })
+
+    # Deduplica e ordina cronologicamente.
+    seen = set()
+    out = []
+    for r in sorted(
+        rests,
+        key=lambda x: (sort_date_value(x['date']), x['round_no'])
+    ):
+        key = (r['round_no'], r['date'])
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+
+    return out
+
+
+def calendar_round_count(section):
+    """Numero di giornate numerate presenti nel calendario."""
+    rounds = {
+        str(m.round_no)
+        for m in section.matches
+        if m.round_no
+    }
+    return len(rounds)
+
+
 def create_excel_for_team(section, selected_team):
-    selected = [m for m in section.matches if m.home == selected_team or m.away == selected_team]
-    selected = sorted(selected, key=lambda m: adjusted_sort_key(section, m))
+    selected = [
+        m for m in section.matches
+        if m.home == selected_team or m.away == selected_team
+    ]
+    rests = infer_rest_events(section, selected_team)
+
+    # Unisce gare e riposi per stamparli nell'ordine corretto.
+    rows = []
+
+    for m in selected:
+        rows.append((
+            sort_date_value(adjusted_match_date(section, m)),
+            0,
+            'match',
+            m
+        ))
+
+    for r in rests:
+        rows.append((
+            sort_date_value(r['date']),
+            1,
+            'rest',
+            r
+        ))
+
+    rows.sort(key=lambda x: (x[0], x[1]))
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Calendario"
-    ws.append(["Data", "Ora", "Tipo", "Squadra casa", "Squadra ospite", "Indirizzo"])
+    ws.title = 'Calendario'
+    ws.append([
+        'Data',
+        'Ora',
+        'Tipo',
+        'Squadra casa',
+        'Squadra ospite',
+        'Indirizzo'
+    ])
 
-    for m in selected:
-        ws.append([
-            excel_date_value(adjusted_match_date(section, m)),
-            excel_time_value(m.time),
-            "CAMPIONATO",
-            m.home,
-            m.away,
-            indirizzo_excel(m),
-        ])
+    for _, _, row_type, obj in rows:
+        if row_type == 'match':
+            m = obj
+            ws.append([
+                excel_date_value(adjusted_match_date(section, m)),
+                excel_time_value(m.time),
+                'CAMPIONATO',
+                m.home,
+                m.away,
+                indirizzo_excel(m),
+            ])
+        else:
+            r = obj
+            # Manteniamo "CAMPIONATO" nella colonna Tipo, come richiesto
+            # dal formato di importazione, e segnaliamo il riposo come avversario.
+            ws.append([
+                excel_date_value(r['date']),
+                '',
+                'CAMPIONATO',
+                selected_team,
+                'RIPOSO',
+                '',
+            ])
+
         row = ws.max_row
-        ws.cell(row=row, column=1).number_format = "dd/mm/yy"
-        ws.cell(row=row, column=2).number_format = "hh:mm"
-        ws.cell(row=row, column=1).alignment = Alignment(horizontal="center")
-        ws.cell(row=row, column=2).alignment = Alignment(horizontal="center")
+        ws.cell(row=row, column=1).number_format = 'dd/mm/yy'
+        ws.cell(row=row, column=2).number_format = 'hh:mm'
+        ws.cell(row=row, column=1).alignment = Alignment(horizontal='center')
+        ws.cell(row=row, column=2).alignment = Alignment(horizontal='center')
+
+        if row_type == 'rest':
+            # Evidenziazione discreta della riga di riposo.
+            for col in range(1, 7):
+                ws.cell(row=row, column=col).font = Font(italic=True)
 
     for c in ws[1]:
         c.font = Font(bold=True)
-        c.alignment = Alignment(horizontal="center")
+        c.alignment = Alignment(horizontal='center')
 
     widths = [14, 10, 16, 32, 32, 52]
-    for i, width in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = width
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
 
-    ws.freeze_panes = "A2"
+    ws.freeze_panes = 'A2'
     ws.auto_filter.ref = ws.dimensions
 
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
-    return out.getvalue(), selected
+
+    return out.getvalue(), selected, rests
 
 
-def safe_filename(value):
-    s = clean(value)
-    s = re.sub(r"[^A-Z0-9]+", "_", s).strip("_")
-    return s or "SQUADRA"
+def safe_filename(s):
+    s=clean(s)
+    s=re.sub(r'[^A-Z0-9]+','_',s).strip('_')
+    return s or 'SQUADRA'
 
-
-# ============================================================
-# CACHE / DIAGNOSTICA
-# ============================================================
 
 @st.cache_data(show_spinner=False)
-def analyze_upload_v4(file_bytes, filename, parser_version):
-    suffix = Path(filename).suffix.lower()
-    if suffix not in {".pdf", ".docx"}:
-        raise ValueError("Sono supportati file PDF e DOCX.")
-
-    tmp = None
+def analyze_upload_v24(file_bytes, filename, parser_version):
+    # parser_version e' volutamente un argomento: entra nella chiave della cache
+    # di Streamlit. Quando aggiorniamo il parser, i risultati delle vecchie
+    # versioni non possono quindi essere riutilizzati per errore.
+    suffix=Path(filename).suffix.lower()
+    if suffix not in ['.pdf','.docx']:
+        raise ValueError('Sono supportati file PDF e DOCX.')
+    tmp=None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+        with tempfile.NamedTemporaryFile(delete=False,suffix=suffix) as f:
             f.write(file_bytes)
-            tmp = f.name
-        return parse_docx(tmp) if suffix == ".docx" else parse_pdf(tmp)
+            tmp=f.name
+        if suffix=='.docx':
+            return parse_docx(tmp)
+        return parse_pdf(tmp)
     finally:
         if tmp and os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-
+            try: os.remove(tmp)
+            except: pass
 
 def diagnose_pdf_bytes(file_bytes):
-    info = {"pagine": 0, "giornate_p1": 0, "squadre_p2": 0, "gare_layout": 0, "non_mappate": 0}
-    tmp = None
+    """Diagnostica minima per capire dove si ferma un PDF non riconosciuto."""
+    tmp=None
+    info={'pagine':0,'giornate_p1':0,'squadre_p2':0,'gare_layout':0}
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+        with tempfile.NamedTemporaryFile(delete=False,suffix='.pdf') as f:
             f.write(file_bytes)
-            tmp = f.name
-        doc = fitz.open(tmp)
-        info["pagine"] = len(doc)
-        if len(doc) >= 1:
-            info["giornate_p1"] = len(detect_modern_round_headers(doc[0]))
-        if len(doc) >= 2:
-            teams = parse_team_table(doc[1])
-            info["squadre_p2"] = len(teams)
+            tmp=f.name
+        doc=fitz.open(tmp)
+        info['pagine']=len(doc)
+        if len(doc)>=1:
+            info['giornate_p1']=len(detect_modern_round_headers(doc[0]))
+        if len(doc)>=2:
+            teams=parse_modern_field_table_words_v2(doc[1])
+            info['squadre_p2']=len(teams)
             if teams:
-                matches, diag = parse_modern_layout_calendar(doc[0], teams)
-                info["gare_layout"] = len(matches)
-                info["non_mappate"] = sum(1 for x in diag if x and x[0] == "unmapped")
+                info['gare_layout']=len(parse_modern_layout_calendar(doc[0],teams))
         return info
-    except Exception as exc:
-        info["errore"] = str(exc)
+    except Exception as e:
+        info['errore']=str(e)
         return info
     finally:
         if tmp and os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
+            try: os.remove(tmp)
+            except: pass
 
 
-# ============================================================
-# STREAMLIT
-# ============================================================
+st.set_page_config(page_title='Calendario → Excel', page_icon='⚽', layout='centered')
+st.title('⚽ Calendario → Excel')
+st.caption(f'Versione app: {PARSER_VERSION}')
+st.write('Carica un calendario LND/FIGC, scegli il girone e la squadra, quindi scarica l’Excel.')
 
-st.set_page_config(page_title="Calendario → Excel", page_icon="⚽", layout="centered")
-st.title("⚽ Calendario → Excel")
-st.caption(f"Versione app: {PARSER_VERSION}")
-st.write("Carica un calendario LND/FIGC, scegli il girone e la squadra, quindi scarica l’Excel.")
-
-uploaded = st.file_uploader("1. Carica il calendario", type=["pdf", "docx"])
+uploaded=st.file_uploader('1. Carica il calendario', type=['pdf','docx'])
 
 if uploaded is not None:
-    with st.spinner("Analisi del calendario in corso…"):
+    with st.spinner('Analisi del calendario in corso…'):
         try:
-            sections = analyze_upload_v4(uploaded.getvalue(), uploaded.name, PARSER_VERSION)
-        except Exception as exc:
-            st.error(f"Errore durante la lettura del file: {exc}")
+            sections=analyze_upload_v24(uploaded.getvalue(), uploaded.name, PARSER_VERSION)
+        except Exception as e:
+            st.error(f'Errore durante la lettura del file: {e}')
             st.stop()
 
     if not sections:
-        st.error("Non sono riuscito a riconoscere partite nel file.")
-        if Path(uploaded.name).suffix.lower() == ".pdf":
-            diag = diagnose_pdf_bytes(uploaded.getvalue())
-            with st.expander("Diagnostica PDF", expanded=True):
-                st.write(f"Pagine lette: **{diag.get('pagine', 0)}**")
-                st.write(f"Intestazioni GIORNATA rilevate nella pagina 1: **{diag.get('giornate_p1', 0)}**")
-                st.write(f"Squadre rilevate nella tabella della pagina 2: **{diag.get('squadre_p2', 0)}**")
-                st.write(f"Righe gara ricostruite dal layout: **{diag.get('gare_layout', 0)}**")
-                st.write(f"Righe non associate a una squadra: **{diag.get('non_mappate', 0)}**")
-                if diag.get("errore"):
-                    st.code(diag["errore"])
+        st.error('Non sono riuscito a riconoscere partite nel file.')
+        if Path(uploaded.name).suffix.lower()=='.pdf':
+            diag=diagnose_pdf_bytes(uploaded.getvalue())
+            with st.expander('Diagnostica PDF', expanded=True):
+                st.write(f"Pagine lette: **{diag.get('pagine',0)}**")
+                st.write(f"Intestazioni GIORNATA rilevate nella pagina 1: **{diag.get('giornate_p1',0)}**")
+                st.write(f"Squadre rilevate nella tabella della pagina 2: **{diag.get('squadre_p2',0)}**")
+                st.write(f"Righe gara ricostruite dal layout: **{diag.get('gare_layout',0)}**")
+                if diag.get('errore'):
+                    st.code(diag['errore'])
         st.stop()
 
-    st.success(f"Analisi completata: {len(sections)} sezione/i riconosciuta/e.")
+    st.success(f'Analisi completata: {len(sections)} sezione/i di calendario riconosciuta/e.')
 
-    labels = []
-    for idx, section in enumerate(sections, 1):
-        label = section.label or f"Sezione {idx}"
+    labels=[]
+    for idx,s in enumerate(sections,1):
+        label=s.label or f'Sezione {idx}'
+        # Make duplicated labels distinguishable.
         if label in labels:
-            label = f"{label} ({idx})"
+            label=f'{label} ({idx})'
         labels.append(label)
 
-    if len(sections) > 1:
-        chosen_label = st.selectbox("2. Seleziona categoria / girone", labels)
-        section = sections[labels.index(chosen_label)]
+    if len(sections)>1:
+        chosen_label=st.selectbox('2. Seleziona categoria / girone', labels)
+        section=sections[labels.index(chosen_label)]
     else:
-        section = sections[0]
-        st.info(f"Categoria/Girone: {section.label}")
+        section=sections[0]
+        st.info(f'Categoria/Girone: {section.label}')
 
-    teams = sorted({m.home for m in section.matches} | {m.away for m in section.matches})
+    teams=sorted(set([m.home for m in section.matches]+[m.away for m in section.matches]))
     if not teams:
-        st.error("Nessuna squadra riconosciuta nella sezione selezionata.")
+        st.error('Nessuna squadra riconosciuta nella sezione selezionata.')
         st.stop()
 
-    selected_team = st.selectbox("3. Per quale squadra vuoi l'estrapolazione?", teams)
-    team_matches = [m for m in section.matches if m.home == selected_team or m.away == selected_team]
-    st.write(f"Partite trovate per **{selected_team}**: **{len(team_matches)}**")
+    selected_team=st.selectbox('3. Per quale squadra vuoi l\'estrapolazione?', teams)
+    team_matches=[m for m in section.matches if m.home==selected_team or m.away==selected_team]
+    team_rests=infer_rest_events(section, selected_team)
+    n_rounds=calendar_round_count(section)
 
-    with st.expander("Dettagli analisi"):
-        st.write(f"Versione parser: `{PARSER_VERSION}`")
-        st.write(f"Formato riconosciuto: `{section.source_format}`")
-        st.write(f"Squadre nel girone: **{len(teams)}**")
-        st.write(f"Partite complessive lette: **{len(section.matches)}**")
+    if team_rests:
+        st.write(
+            f'Per **{selected_team}**: **{len(team_matches)} gare trovate**, '
+            f'**{len(team_rests)} riposo/i**'
+            + (f', **{n_rounds} giornate**.' if n_rounds else '.')
+        )
+    else:
+        st.write(
+            f'Partite trovate per **{selected_team}**: **{len(team_matches)}**'
+            + (f' su **{n_rounds} giornate**.' if n_rounds else '.')
+        )
 
-    if st.button("4. Genera Excel", type="primary", use_container_width=True):
-        excel_bytes, extracted = create_excel_for_team(section, selected_team)
-        st.session_state["excel_bytes"] = excel_bytes
-        st.session_state["excel_name"] = f"Calendario_{safe_filename(selected_team)}.xlsx"
-        st.session_state["excel_count"] = len(extracted)
-        st.session_state["excel_key"] = (uploaded.name, section.label, selected_team, PARSER_VERSION)
+    with st.expander('Dettagli analisi'):
+        st.write(f'Versione parser: `{PARSER_VERSION}`')
+        st.write(f'Formato riconosciuto: `{section.source_format}`')
+        st.write(f'Squadre nel girone: {len(teams)}')
+        st.write(f'Partite complessive lette: {len(section.matches)}')
 
-    current_key = (uploaded.name, section.label, selected_team, PARSER_VERSION)
-    if st.session_state.get("excel_key") == current_key and "excel_bytes" in st.session_state:
-        st.success(f"Excel pronto: {st.session_state.get('excel_count', 0)} partite estratte.")
+    if st.button('4. Genera Excel', type='primary', use_container_width=True):
+        excel_bytes, extracted, extracted_rests=create_excel_for_team(section,selected_team)
+        st.session_state['excel_bytes']=excel_bytes
+        st.session_state['excel_name']=f'Calendario_{safe_filename(selected_team)}.xlsx'
+        st.session_state['excel_count']=len(extracted)
+        st.session_state['excel_rest_count']=len(extracted_rests)
+        st.session_state['excel_key']=(uploaded.name,section.label,selected_team)
+
+    current_key=(uploaded.name,section.label,selected_team)
+    if st.session_state.get('excel_key')==current_key and 'excel_bytes' in st.session_state:
+        n_gare=st.session_state.get('excel_count',0)
+        n_riposi=st.session_state.get('excel_rest_count',0)
+        if n_riposi:
+            st.success(f"Excel pronto: {n_gare} gare + {n_riposi} riposo/i.")
+        else:
+            st.success(f"Excel pronto: {n_gare} partite estratte.")
         st.download_button(
-            "⬇️ Scarica Excel",
-            data=st.session_state["excel_bytes"],
-            file_name=st.session_state["excel_name"],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            '⬇️ Scarica Excel',
+            data=st.session_state['excel_bytes'],
+            file_name=st.session_state['excel_name'],
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             use_container_width=True,
         )
 
 st.divider()
-st.caption("Colonne Excel: Data | Ora | CAMPIONATO | Squadra casa | Squadra ospite | Indirizzo - Paese")
+st.caption('Colonne Excel: Data | Ora | CAMPIONATO | Squadra casa | Squadra ospite | Indirizzo - Paese')
